@@ -12,6 +12,7 @@ from app.models.member import Member
 from app.services.providers.base import DailyStats
 from app.services.sync import (
     add_manual_distance,
+    find_duplicate_workout,
     log_checkin,
     record_manual_activity,
     undo_checkin_by_id,
@@ -215,3 +216,66 @@ def test_member_display_name_priority(db_session):
     assert m.display_name == "自定义"
     m.custom_nickname = ""
     assert m.display_name == "111"  # 都空 → 回落到 QQ 号
+
+
+# ---------------------------------------------------------------------------
+# 同日数据指纹判重：同一场运动换张截图不重复累计，两场真实运动各自记录
+# ---------------------------------------------------------------------------
+
+
+def _log(dist, minutes, kcal, start_minute=None):
+    return CheckinLog(
+        member_qq="111",
+        record_date=date.today(),
+        distance_km=dist,
+        active_minutes=minutes,
+        calories=kcal,
+        start_minute=start_minute,
+    )
+
+
+def test_find_duplicate_workout_matches():
+    # 数值指纹一致（含时间）→ 判为同一场运动
+    log = _log(5.02, 35, 340, start_minute=7 * 60 + 32)
+    data = {"distance_km": 5.03, "active_minutes": 36, "calories": 344}
+    assert find_duplicate_workout(data, 7 * 60 + 32, [log]) is log
+
+
+def test_find_duplicate_workout_diff_values():
+    # 数值不同 → 不同场（同一天两场真实运动各自记录）
+    log = _log(5.02, 35, 340, start_minute=7 * 60 + 32)
+    data = {"distance_km": 8.1, "active_minutes": 52, "calories": 520}
+    assert find_duplicate_workout(data, 18 * 60 + 0, [log]) is None
+
+
+def test_find_duplicate_workout_time_conflict():
+    # 数值恰好相同但开始时间相差 >20 分钟 → 两场不同运动
+    log = _log(5.02, 35, 340, start_minute=7 * 60 + 32)
+    data = {"distance_km": 5.03, "active_minutes": 36, "calories": 344}
+    assert find_duplicate_workout(data, 18 * 60 + 5, [log]) is None
+
+
+def test_find_duplicate_workout_missing_time_still_matches():
+    # 任一侧没识别出时间 → 时间不参与判定，仍按数值判重
+    log = _log(5.02, 35, 340)
+    data = {"distance_km": 5.03, "active_minutes": 36, "calories": 344}
+    assert find_duplicate_workout(data, None, [log]) is log
+
+
+def test_find_duplicate_workout_no_logs():
+    assert find_duplicate_workout({"distance_km": 5.02}, None, []) is None
+
+
+def test_log_checkin_stores_start_minute(db_session):
+    # 截图识别的开始时间随打卡明细一起落库（供判重与「今日明细」时段展示）
+    m = Member(qq="111", nickname="甲")
+    db_session.add(m)
+    db_session.commit()
+    d = date.today()
+    add_manual_distance(m, 5.0, db_session)
+    record_manual_activity(m, d, DailyStats(date=d, distance_km=5.0), db_session)
+    log_checkin("111", d, 5.0, db_session, start_minute=7 * 60 + 32)
+    db_session.commit()
+
+    lg = db_session.execute(select(CheckinLog).where(CheckinLog.member_qq == "111")).scalars().one()
+    assert lg.start_minute == 7 * 60 + 32

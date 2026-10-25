@@ -1,6 +1,8 @@
 """COROS 运动记录解析测试：只统计跑步类（100/102/103），游泳/骑行等跳过。"""
 
-from app.services.providers.coros import CorosProvider
+import pytest
+
+from app.services.providers.coros import CorosProvider, TokenRevokedError
 
 
 def test_parse_sport_records_filters_running_only():
@@ -121,3 +123,42 @@ def test_parse_activity_ascent_treadmill_total_ascent():
 def test_parse_activity_ascent_empty():
     assert CorosProvider._parse_activity_ascent("") == 0.0
     assert CorosProvider._parse_activity_ascent("Distance: 5.00 km\nCalories: 200 kcal") == 0.0
+
+
+def test_refresh_invalid_grant_raises_revoked(monkeypatch):
+    # refresh 返回 400 invalid_grant（服务端吊销授权）→ 抛 TokenRevokedError，
+    # 与普通网络/参数错误区分，上层据此删死 token 并提醒成员重新绑定。
+    import httpx
+
+    class FakeResp:
+        status_code = 400
+        text = '{"error":"invalid_grant"}'
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: FakeResp())
+    with pytest.raises(TokenRevokedError):
+        CorosProvider()._refresh("123", {"refresh_token": "y", "client_id": "c"})
+
+
+def test_ensure_token_revoked_deletes_token_and_notifies(tmp_path, monkeypatch):
+    # 授权被吊销：删除死 token（避免每次同步白打 refresh）、提醒成员重新绑定（24h 去重）、
+    # 错误升级为带「绑定 coros」引导的 RuntimeError（2026-10-20 官方批量吊销实测）。
+    from app.services import notify
+
+    token_dir = tmp_path / "accounts"
+    monkeypatch.setattr(CorosProvider, "_DIR", token_dir)
+    token_file = token_dir / "coros_123.json"
+    token_dir.mkdir()
+    token_file.write_text('{"access_token": "x", "refresh_token": "y", "expires_at_epoch": 1}')
+
+    def fake_refresh(self, qq, token):
+        raise TokenRevokedError("revoked")
+
+    monkeypatch.setattr(CorosProvider, "_refresh", fake_refresh)
+    prov = CorosProvider()
+    with pytest.raises(RuntimeError, match="绑定 coros"):
+        prov._ensure_token("123")
+    assert not token_file.exists()
+    items = notify.drain()
+    assert len(items) == 1
+    qq, text, _ = items[0]
+    assert qq == "123" and "绑定 coros" in text

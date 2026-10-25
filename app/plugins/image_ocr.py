@@ -16,8 +16,10 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.log import logger
 from nonebot.rule import Rule
 from PIL import Image, ImageOps
+from sqlalchemy import func, select
 
 from ..db import get_session
+from ..models.checkin_log import CheckinLog
 from ..models.member import Member
 from ..services import checkin, cheers, llm, net, parsers, ranking, sync, timeutil
 from ..services.member import get_or_create_member
@@ -119,10 +121,13 @@ def _format_data(data: dict) -> list:
     return cheers.format_stat_lines(data)
 
 
-def _format_cheer(data: dict) -> str:
-    """把识别结果渲染成鼓励语气回复：开场/结尾按数据上下文选取（集中在 cheers 库）。"""
+def _format_cheer(data: dict, period: str = "") -> str:
+    """把识别结果渲染成鼓励语气回复：开场/结尾按数据上下文选取（集中在 cheers 库）。
+
+    period 为截图识别的运动开始时段（「清晨」「晚上」），有距离时开场优先用它称呼。
+    """
     lines = _format_data(data)
-    return cheers.opener(data) + "\n" + "\n".join(lines) + "\n\n" + cheers.closer(data)
+    return cheers.opener(data, period) + "\n" + "\n".join(lines) + "\n\n" + cheers.closer(data)
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +233,7 @@ async def handle_image(bot: Bot, event: MessageEvent):
     # 前置到 OCR/视觉之前，既防重复累计，也避免重复截图反复消耗本地 OCR 与视觉调用。
     if not bound and _is_duplicate(img_md5, img_dhash):
         logger.info(f"[图片识别] qq={qq} 检测到重复截图，跳过识别")
-        await image_matcher.finish("⏳ 这张截图刚才已经记过啦，本次不重复累计")
+        await image_matcher.finish(f"⏳ {name}，这张截图刚才已经记过啦，本次不重复累计～")
 
     # 保存原始图片，便于排查 OCR 识别误差
     try:
@@ -312,6 +317,15 @@ async def handle_image(bot: Bot, event: MessageEvent):
         logger.info(f"[图片识别] qq={qq} 识别为统计/列表页，静默跳过")
         return
 
+    # 运动开始时间（辅助信号）：供同日多场运动判重与回复时段文案使用。
+    # 识别不出不阻断主链路，只退化为「不参与判重、不用时段称呼」。
+    start_minute = None
+    tm = parsers.extract_workout_time(result) or parsers.extract_workout_time_text(text)
+    if tm:
+        start_minute = tm[0] * 60 + tm[1]
+        logger.info(f"[图片识别] qq={qq} 识别到运动开始时间 {tm[0]:02d}:{tm[1]:02d}")
+    period_str = cheers.day_period(start_minute)
+
     # 可疑图补一次视觉兜底：OCR 读出了距离但数值可疑（如 5.20 km 被读成 52.0 km →
     # 距离/时长推出的速度明显超限；或每公里消耗离谱），说明识别质量存疑。此时若本次
     # 还没咨询过 vision、且非绑定成员，只对这一张可疑图补一次视觉 + 分歧复核：
@@ -375,11 +389,12 @@ async def handle_image(bot: Bot, event: MessageEvent):
         # 已绑定平台：截图仅回显不写库（数据已由平台接口自动同步），并明确告知
         # 「以 App 为准」，避免用户误以为截图又被记了一次、结果「今日」却没变化。
         await image_matcher.finish(
-            _format_cheer(data)
+            f"{name}，"
+            + _format_cheer(data, period_str)
             + "\n\n📌 你已绑定平台，本次截图未计入数据，今日与排行均以 App 同步为准"
         )
     if "distance_km" not in data:
-        await image_matcher.finish(_format_cheer(data))
+        await image_matcher.finish(f"{name}，" + _format_cheer(data, period_str))
 
     # 「今日群内第 N 名」需全群当天数据齐全：先同步已绑定成员的今日数据（带节流，
     # 10 分钟内复用上次结果），让截图成员的名次与绑定成员同口径——否则会漏掉今天
@@ -397,57 +412,104 @@ async def handle_image(bot: Bot, event: MessageEvent):
     lottery_result: tuple[int, list[str]] | None = None
     streak = 0
     today_rank: int | None = None
+    dup_reply: str | None = None
     session = get_session()
     try:
         member = get_or_create_member(session, qq, name)
-        total = sync.add_manual_distance(member, data["distance_km"], session)
-        # 截图记录也进当日明细，让未绑定成员出现在每日排行里。
-        # parsers 返回 dict，统一转成 DailyStats（过滤非模型字段，防御未来新增键）。
         today_d = timeutil.today()
-        stats = DailyStats(
-            date=today_d,
-            **{k: v for k, v in data.items() if k in DailyStats.model_fields},
-        )
-        sync.record_manual_activity(member, today_d, stats, session)
-        sync.log_checkin(
-            qq,
-            today_d,
-            data["distance_km"],
-            session,
-            ascent_meters=data.get("ascent_meters", 0.0),
-            calories=data.get("calories", 0),
-            active_minutes=data.get("active_minutes", 0),
-        )
 
-        # 打卡彩蛋：里程碑 / 礼物 / 节日+特殊距离 / 群抽奖（幂等，状态表保证只触发一次）
-        checkin_total = checkin.total_days(qq, session)
-        milestone_hits = checkin.crossed_milestones(qq, checkin_total, session)
-        gift_rank = checkin.auto_gift(qq, checkin_total, session)
-        fest = checkin.check_festival(qq, today_d, data.get("distance_km", 0.0), session)
-        lt = checkin.check_lottery(session)
-        if lt is not None:
-            winners = checkin.draw_lottery(session)
-            winner_names = []
-            for w in winners:
-                m = session.get(Member, w)
-                winner_names.append(m.display_name if m else w)
-            lottery_result = (lt, winner_names)
-        session.commit()
-        # 连续打卡 + 今日名次：落库后同 session 读，保证含本次刚写入的记录
-        streak = checkin.current_streak(qq, session)
-        today_rank = ranking.today_distance_rank(qq, session)
-        # 全部落库成功后才标记去重：commit 失败不会漏标，重发仍能补记
-        _mark_seen(img_md5, img_dhash)
+        # 同日数据指纹判重（仅未绑定成员）：同一场运动换了张截图（详情页 / 分享卡片 /
+        # 不同 App 同一次），数值几乎一致 → 不重复落库；同一天两场真实运动数值不同
+        # （或开始时间相差 >20 分钟）→ 各自记录。写在任何落库动作之前。
+        if "distance_km" in data:
+            logs = (
+                session.execute(
+                    select(CheckinLog).where(
+                        CheckinLog.member_qq == qq, CheckinLog.record_date == today_d
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if sync.find_duplicate_workout(data, start_minute, logs) is not None:
+                dup_reply = (
+                    f"⏳ {name}，这场运动已经记过啦～\n"
+                    "识别内容和你今天已记录的一场运动几乎一致，"
+                    "同一场运动换张截图只记一次，本次不重复累计。\n"
+                    "新的一场运动直接发新截图就好～"
+                )
+
+        if dup_reply is None:
+            total = sync.add_manual_distance(member, data["distance_km"], session)
+            # 截图记录也进当日明细，让未绑定成员出现在每日排行里。
+            # parsers 返回 dict，统一转成 DailyStats（过滤非模型字段，防御未来新增键）。
+            stats = DailyStats(
+                date=today_d,
+                **{k: v for k, v in data.items() if k in DailyStats.model_fields},
+            )
+            sync.record_manual_activity(member, today_d, stats, session)
+            sync.log_checkin(
+                qq,
+                today_d,
+                data["distance_km"],
+                session,
+                ascent_meters=data.get("ascent_meters", 0.0),
+                calories=data.get("calories", 0),
+                active_minutes=data.get("active_minutes", 0),
+                start_minute=start_minute,
+            )
+            # 当天第几次截图运动：第 2 次起回复给「一天两练」类专属文案（落库后统计含本次）
+            day_count = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(CheckinLog)
+                    .where(CheckinLog.member_qq == qq, CheckinLog.record_date == today_d)
+                )
+                or 0
+            )
+
+            # 打卡彩蛋：里程碑 / 礼物 / 节日+特殊距离 / 群抽奖（幂等，状态表保证只触发一次）
+            checkin_total = checkin.total_days(qq, session)
+            milestone_hits = checkin.crossed_milestones(qq, checkin_total, session)
+            gift_rank = checkin.auto_gift(qq, checkin_total, session)
+            fest = checkin.check_festival(qq, today_d, data.get("distance_km", 0.0), session)
+            lt = checkin.check_lottery(session)
+            if lt is not None:
+                winners = checkin.draw_lottery(session)
+                winner_names = []
+                for w in winners:
+                    m = session.get(Member, w)
+                    winner_names.append(m.display_name if m else w)
+                lottery_result = (lt, winner_names)
+            session.commit()
+            # 连续打卡 + 今日名次：落库后同 session 读，保证含本次刚写入的记录
+            streak = checkin.current_streak(qq, session)
+            today_rank = ranking.today_distance_rank(qq, session)
+            # 全部落库成功后才标记去重：commit 失败不会漏标，重发仍能补记
+            _mark_seen(img_md5, img_dhash)
     except Exception as e:
         logger.exception(f"[图片识别] qq={qq} 记录失败: {e}")
-        await image_matcher.finish("记录失败，请稍后重试，或发「帮助」看我能做什么")
+        await image_matcher.finish(
+            "😅 记到一半出错了，稍后再发一次这张图试试；还不行就发「帮助」找我聊聊～"
+        )
     finally:
         session.close()
 
+    if dup_reply is not None:
+        # 数据指纹判重：同一场运动换了张截图，不落库，只说明原因（不 _mark_seen——
+        # 成员删除打卡后可以用这张图重新补记，标记了反而会拦掉）。
+        logger.info(f"[图片识别] qq={qq} 同日数据指纹判重，跳过记录")
+        await image_matcher.finish(dup_reply)
+
     reply = (
-        _format_cheer(data)
+        f"{name}，"
+        + _format_cheer(data, period_str)
         + f"\n\n✅ 已记入今日数据：本次 +{data['distance_km']} km，累计 {total} km，发「今日」即可查看"
     )
+    if day_count >= 2:
+        note = cheers.multi_session_note(day_count)
+        if note:
+            reply += f"\n{note}"
     if streak:
         note = cheers.streak_note(streak)
         line = f"🔥 连续打卡 {streak} 天"

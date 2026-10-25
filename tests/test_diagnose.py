@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 from app.models.daily_record import DailyRecord
 from app.models.member import Member
+from app.services import timeutil
 from app.services.diagnose import (
     compute_diagnosis,
     compute_load_status,
@@ -98,7 +99,7 @@ def test_load_status_insufficient_data(db_session):
 
 
 def test_compute_diagnosis_hr_zones_needs_age_and_resting(db_session):
-    today = date(2026, 10, 18)
+    today = timeutil.today()
     # 无年龄 → 不计算心率区间
     db_session.add(Member(qq="111", nickname="甲", platform="", age=0))
     db_session.add(
@@ -126,7 +127,7 @@ def test_compute_diagnosis_hr_zones_needs_age_and_resting(db_session):
 
 
 def test_format_diagnosis_includes_new_sections(db_session):
-    today = date(2026, 10, 18)
+    today = timeutil.today()
     db_session.add(Member(qq="111", nickname="甲", platform="", age=25))
     for i in range(30):
         db_session.add(

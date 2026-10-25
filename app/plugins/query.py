@@ -8,6 +8,7 @@ from nonebot.log import logger
 from sqlalchemy import select
 
 from ..db import get_session
+from ..models.checkin_log import CheckinLog
 from ..models.daily_record import DailyRecord
 from ..models.member import Member
 from ..services import checkin, cheers, llm, ranking, sync, timeutil
@@ -175,6 +176,23 @@ async def build_today(qq: str, nickname: str, bot=None, gid=None) -> str:
             )
 
         text = _format_manual(nickname, today, rec, total, week)
+        # 当天多场运动（≥2 次截图）逐条列出：帮成员确认「早上/晚上」每一场都记上了，
+        # 时段来自截图识别的开始时间（识别不出则按顺序编号）。
+        day_logs = (
+            session.execute(
+                select(CheckinLog)
+                .where(CheckinLog.member_qq == qq, CheckinLog.record_date == today)
+                .order_by(CheckinLog.id)
+            )
+            .scalars()
+            .all()
+        )
+        if len(day_logs) >= 2:
+            lines = []
+            for i, lg in enumerate(day_logs, 1):
+                label = cheers.day_period(lg.start_minute) or f"第 {i} 次"
+                lines.append(f"· {label}：{lg.distance_km} km")
+            text += "\n\n📋 今日明细：\n" + "\n".join(lines)
         text += f"\n\n{_checkin_badge(qq)}"
         text += await _milestone_cheers(qq, nickname)
         text += await _daily_cheer(nickname, rec)

@@ -53,6 +53,7 @@ _MIGRATIONS = {
         "ascent_meters": "FLOAT DEFAULT 0",
         "calories": "INTEGER DEFAULT 0",
         "active_minutes": "INTEGER DEFAULT 0",
+        "start_minute": "INTEGER",
     },
     "activity": {
         "kind": "VARCHAR(16) DEFAULT 'manual'",

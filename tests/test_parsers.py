@@ -2,9 +2,12 @@
 
 from app.services.parsers import (
     detect_page_kind,
+    extract_workout_time,
+    extract_workout_time_text,
     find_field_conflicts,
     parse_activity,
     parse_activity_from_boxes,
+    same_workout_fields,
     sanitize_activity,
     suspicious_signals,
 )
@@ -187,6 +190,56 @@ def test_parse_boxes_prose_label_not_anchor():
     assert "ascent_meters" not in data
 
 
+def test_parse_boxes_ascent_not_distance_in_meters():
+    # 阳光体育校园跑：距离以米显示（「2099m」），页面无任何爬升标签。
+    # 该框已被距离字段占用，爬升不得再把它读成 2099 m（2026-10-20 实测事故：
+    # 2.1 km 的截图被记成 2099 m 爬升，污染爬升排行）。
+    result = [
+        (_box(100.0, 200.0), "距离", 0.99),
+        (_box(260.0, 200.0), "2099m", 0.99),
+    ]
+    data = parse_activity_from_boxes(result)
+    assert data["distance_km"] == 2.099
+    assert "ascent_meters" not in data
+
+
+def test_parse_boxes_ascent_ignores_stray_unit_m():
+    # 状态栏杂讯：孤立的「m」框 + 邻近无关数字「2035GA」，页面无爬升标签。
+    # 爬升禁走单位框定位（no_unit_box），不得把 2035 当爬升（2026-10-16 实测事故：
+    # 6.47 km 的截图被记成 2035 m 爬升）。
+    result = [
+        (_box(60.0, 30.0), "2/:42", 0.9),
+        (_box(120.0, 30.0), "m", 0.9),  # 孤立单位框（状态栏杂讯）
+        (_box(200.0, 30.0), "2035GA", 0.9),
+        (_box(600.0, 900.0), "距离", 0.99),
+        (_box(700.0, 900.0), "6.47", 0.99),
+        (_box(760.0, 900.0), "公里", 0.99),
+    ]
+    data = parse_activity_from_boxes(result)
+    assert data["distance_km"] == 6.47
+    assert "ascent_meters" not in data
+
+
+def test_sanitize_drops_ascent_equal_to_distance_in_meters():
+    # 「距离被读成爬升」的经典指纹：爬升 ≈ 距离(km)×1000。真实运动 1 km 对应
+    # 1000 m 爬升 = 全程约 45° 坡度，跑步/徒步不可能；按 1% 容差丢弃爬升。
+    cleaned, reject = sanitize_activity({"distance_km": 2.1, "ascent_meters": 2099.0})
+    assert reject is None
+    assert "distance_km" in cleaned
+    assert "ascent_meters" not in cleaned
+    # 距离缺失时不做交叉校验（无指纹可判），爬升保留
+    cleaned, reject = sanitize_activity({"ascent_meters": 2099.0})
+    assert cleaned["ascent_meters"] == 2099.0
+
+
+def test_sanitize_keeps_plausible_ascent():
+    # 正常越野（4 km / 150 m）与陡峭徒步（3 km / 1000 m，VK 级）均保留
+    cleaned, _ = sanitize_activity({"distance_km": 4.03, "ascent_meters": 150.0})
+    assert cleaned["ascent_meters"] == 150.0
+    cleaned, _ = sanitize_activity({"distance_km": 3.0, "ascent_meters": 1000.0})
+    assert cleaned["ascent_meters"] == 1000.0
+
+
 def test_find_field_conflicts_agree():
     a = {"distance_km": 6.23, "calories": 400, "avg_hr": 160}
     b = {"distance_km": 6.2, "calories": 405, "avg_hr": 161}
@@ -286,6 +339,106 @@ def test_suspicious_signals_requires_distance():
     assert suspicious_signals({}) == []
     assert suspicious_signals({"distance_km": 0, "active_minutes": 30}) == []
     assert suspicious_signals({"steps": 8000, "calories": 300}) == []
+
+
+def test_extract_workout_time_datetime_combo():
+    # 日期+时间组合（详情页开始时间最强信号）：「9月25日 07:32」等写法
+    result = [(_box(200.0, 80.0, w=140), "9月25日 07:32", 0.99)]
+    assert extract_workout_time(result) == (7, 32)
+
+
+def test_extract_workout_time_slash_and_iso_dates():
+    result = [(_box(200.0, 80.0, w=140), "09-25 07:32", 0.99)]
+    assert extract_workout_time(result) == (7, 32)
+    result = [(_box(200.0, 80.0, w=180), "2026-09-25 07:32", 0.99)]
+    assert extract_workout_time(result) == (7, 32)
+    result = [(_box(200.0, 80.0, w=180), "2026年9月25日 07:32", 0.99)]
+    assert extract_workout_time(result) == (7, 32)
+
+
+def test_extract_workout_time_cn_period():
+    # 中文时段+时间：「下午4:04」→ 16:04
+    result = [(_box(200.0, 80.0, w=100), "下午4:04", 0.99)]
+    assert extract_workout_time(result) == (16, 4)
+    result = [(_box(200.0, 80.0, w=120), "上午 9:20", 0.99)]
+    assert extract_workout_time(result) == (9, 20)
+
+
+def test_extract_workout_time_top_bare_hhmm():
+    # 纯 HH:MM 兜底：只认页面顶部 1/4 的框
+    result = [
+        (_box(200.0, 80.0), "07:32", 0.99),
+        (_box(200.0, 600.0), "距离", 0.99),
+        (_box(300.0, 600.0), "5.02", 0.99),
+    ]
+    assert extract_workout_time(result) == (7, 32)
+
+
+def test_extract_workout_time_bare_not_top_ignored():
+    # 页面中部（超过顶部 1/4）的同形框不提取——可能是时长
+    result = [(_box(200.0, 300.0), "13:45", 0.99), (_box(200.0, 500.0), "距离", 0.99)]
+    assert extract_workout_time(result) is None
+
+
+def test_extract_workout_time_duration_near_label_ignored():
+    # 紧邻时长标签的「13:45」是时长（13 小时 45 分级别罕见，但标签已明确）→ 不当开始时间
+    result = [
+        (_box(100.0, 200.0), "训练时长", 0.99),
+        (_box(260.0, 200.0), "13:45", 0.99),
+        (_box(100.0, 600.0), "距离", 0.99),
+    ]
+    assert extract_workout_time(result) is None
+
+
+def test_extract_workout_time_duration_not_valid_hour():
+    # 「40:16」= 40 分钟时长，作为时刻不合法 → 不提取
+    result = [(_box(200.0, 80.0), "40:16", 0.99)]
+    assert extract_workout_time(result) is None
+
+
+def test_extract_workout_time_text():
+    assert extract_workout_time_text("户外跑步 9月25日 07:32") == (7, 32)
+    assert extract_workout_time_text("户外跑步\n下午4:04") == (16, 4)
+    # 三冒号时长「00:24:52」不应被拆出「00:24」当时间
+    assert extract_workout_time_text("时长 00:24:52\n距离 4.03") is None
+    # 日期时间串（无空格式）：「09-08」+「10:00」仍可提取出事件时间——它本来就是
+    # 该串里的时刻，作辅助信号无害（非运动图会在更早的静默判据被拦下）
+    assert extract_workout_time_text("时间 2026-09-0810:00:00") == (10, 0)
+
+
+def test_same_workout_fields_match():
+    # 同一场运动两张截图：OCR 抖动范围内数值一致 → 判同场
+    a = {"distance_km": 5.02, "active_minutes": 35, "calories": 340}
+    b = {"distance_km": 5.03, "active_minutes": 36, "calories": 344}
+    assert same_workout_fields(a, b)
+
+
+def test_same_workout_fields_diff_distance():
+    assert not same_workout_fields(
+        {"distance_km": 5.02, "active_minutes": 35},
+        {"distance_km": 6.0, "active_minutes": 35},
+    )
+
+
+def test_same_workout_fields_single_field_not_enough():
+    # 只有距离可比 → 不判同场（两场距离接近的真实运动不能只靠距离合并）
+    assert not same_workout_fields({"distance_km": 5.02}, {"distance_km": 5.03})
+
+
+def test_same_workout_fields_aux_field_diff():
+    # 辅助字段显著不同 → 不同场（5.02/35min vs 5.02/50min）
+    assert not same_workout_fields(
+        {"distance_km": 5.02, "active_minutes": 35},
+        {"distance_km": 5.02, "active_minutes": 50},
+    )
+
+
+def test_same_workout_fields_attr_object():
+    # b 侧支持带同名属性的对象（CheckinLog）
+    from app.models.checkin_log import CheckinLog
+
+    log = CheckinLog(distance_km=5.02, active_minutes=35, calories=340)
+    assert same_workout_fields({"distance_km": 5.03, "active_minutes": 36, "calories": 345}, log)
 
 
 def test_parse_boxes_duration_datetime_box_ignored():

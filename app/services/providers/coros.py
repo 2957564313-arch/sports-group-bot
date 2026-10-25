@@ -12,8 +12,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 from nonebot.log import logger
 
-from .. import credentials, timeutil
+from .. import alert, credentials, notify, timeutil
 from .base import DailyStats, SportProvider
+
+
+class TokenRevokedError(RuntimeError):
+    """COROS 服务端已吊销该授权（refresh 返回 invalid_grant），需成员重新绑定。"""
 
 
 class CorosProvider(SportProvider):
@@ -215,12 +219,30 @@ class CorosProvider(SportProvider):
     # token 管理
     # ------------------------------------------------------------------
 
+    # 授权失效的成员私聊提醒文案（24h 去重，见 services.notify）
+    _REBIND_NOTICE = (
+        "⚠️ 你的高驰（COROS）授权已失效，今日起运动数据无法自动同步。\n"
+        "请私聊我发送「绑定 coros」重新授权（约 1 分钟），"
+        "完成后数据照常统计，历史记录不受影响～"
+    )
+
     def _ensure_token(self, qq: str) -> str:
         token = self._load_json(self._token_path(qq))
         if not token or not token.get("access_token"):
             raise RuntimeError("COROS 尚未授权，请发送「绑定 coros」完成授权")
         if time.time() > token.get("expires_at_epoch", 0) - 300:
-            token = self._refresh(qq, token)
+            try:
+                token = self._refresh(qq, token)
+            except TokenRevokedError:
+                # 授权已被官方吊销（refresh 无效）：本地 token 已无意义，删掉避免
+                # 后续每次同步都白打一次 refresh；主动私聊提醒成员重新绑定，并登记
+                # 运维告警让管理员知晓。
+                self._token_path(qq).unlink(missing_ok=True)
+                notify.enqueue(qq, self._REBIND_NOTICE)
+                alert.record(
+                    "coros:revoked", f"COROS 授权被官方吊销（已私聊提醒成员 {qq} 重新绑定）"
+                )
+                raise RuntimeError("COROS 授权已失效，请重新发送「绑定 coros」授权") from None
         return token["access_token"]
 
     def _refresh(self, qq: str, token: dict) -> dict:
@@ -237,6 +259,11 @@ class CorosProvider(SportProvider):
             timeout=30,
         )
         if r.status_code != 200:
+            # invalid_grant = refresh token 已被服务端吊销（2026-10-20 起官方批量
+            # 吊销动态客户端旧授权，全员同步失败）。与普通网络/参数错误区分开，
+            # 上层据此删除死 token 并提醒成员重新绑定，而不是反复无效重试。
+            if "invalid_grant" in r.text:
+                raise TokenRevokedError("COROS 授权已被官方吊销（invalid_grant）")
             raise RuntimeError(f"COROS token 刷新失败：{r.status_code} {r.text[:200]}")
         new_token = r.json()
         new_token["client_id"] = token.get("client_id")

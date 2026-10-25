@@ -287,6 +287,10 @@ _FIELD_SPECS = [
         "units": ["m", "米"],
         "kind": "decimal",
         "convert": lambda v: float(_normalize_number(v)),
+        # 单位「m/米」与距离单位重合，独立单位框定位会把状态栏杂讯（孤立的 m）或
+        # 米制距离值误当爬升（2026-10-16「2035」、10-20「2099m」两起实例），
+        # 故爬升禁走单位框定位，只认「爬升」等标签锚点或未被他字段占用的合并框。
+        "no_unit_box": True,
     },
     {
         "key": "avg_pace_sec_per_km",
@@ -520,11 +524,15 @@ def _value_near(items, anchor, extractor, spec=None):
       - 左侧同行（单位在值右，如「15.02 km」分框）
       - 右侧同行（标签在左、值在右，如「距离 5.2」分框）
     多个候选取离 anchor 最近的；离谱值（QQ 号/日期串级）先按 _plausible 排除。
+
+    一个值框只归属一个字段：被选中的框打 ``_used`` 标记，后续字段不再考虑它——
+    防止「2099m」这种米制距离框先被距离字段取走、又被爬升字段再取一遍。
     """
     best = None
+    best_item = None
     best_dist = 1e9
     for it in items:
-        if it is anchor:
+        if it is anchor or it.get("_used"):
             continue
         v = extractor(it["text"])
         if v is None or (spec is not None and not _plausible(spec, v)):
@@ -545,6 +553,9 @@ def _value_near(items, anchor, extractor, spec=None):
         if dist < best_dist:
             best_dist = dist
             best = v
+            best_item = it
+    if best_item is not None:
+        best_item["_used"] = True
     return best
 
 
@@ -589,20 +600,26 @@ def _extract_field(items, spec):
             if v is not None:
                 return v
 
-    # 2) 单位框定位（「km」「kcal」「min」等独立单位框）
-    for it in items:
-        if it["text"].strip().lower() in units:
-            v = _value_near(items, it, extractor, spec)
-            if v is not None:
-                return v
+    # 2) 单位框定位（「km」「kcal」「min」等独立单位框）。
+    #    单位「m/米」与距离单位重合的字段（爬升）禁走此路径：孤立 m 框多为
+    #    状态栏杂讯，会把邻近无关数字误当爬升（见 _FIELD_SPECS 的 no_unit_box）。
+    if not spec.get("no_unit_box"):
+        for it in items:
+            if it["text"].strip().lower() in units:
+                v = _value_near(items, it, extractor, spec)
+                if v is not None:
+                    return v
 
-    # 3) 合并框（数字与单位同框，如「7.35KM」「603KCAL」）
+    # 3) 合并框（数字与单位同框，如「7.35KM」「603KCAL」）；已被其它字段
+    #    占用的值框跳过（一个值框只归属一个字段，见 _value_near）。
     for it in items:
         t = it["text"].strip()
-        if t[:1].isdigit() and _has_unit_token(t, units):
-            v = extractor(t)
-            if v is not None and _plausible(spec, v):
-                return v
+        if it.get("_used") or not t[:1].isdigit() or not _has_unit_token(t, units):
+            continue
+        v = extractor(t)
+        if v is not None and _plausible(spec, v):
+            it["_used"] = True
+            return v
 
     return None
 
@@ -621,6 +638,112 @@ def parse_activity_from_boxes(result) -> dict:
             except (ValueError, TypeError):
                 continue
     return data
+
+
+# ---------------------------------------------------------------------------
+# 运动开始时间提取：供「同一天多场运动」区分（判重用）与回复时段文案使用。
+# 辅助信号：提取失败不影响核心字段落库，调用方退化为「不参与判重/时段称呼」。
+# ---------------------------------------------------------------------------
+
+# 日期+时间组合（详情页开始时间的最强信号）：
+# 「9月25日 07:32」「09-25 07:32」「2026-09-25 07:32」「2026年9月25日 07:32」
+_DATETIME_WITH_TIME = re.compile(
+    r"(?:\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?|\d{1,2}月\d{1,2}日|\d{1,2}[-/]\d{1,2})\s*"
+    r"([01]?\d|2[0-3])[:：]([0-5]\d)"
+)
+
+# 中文时段+时间：「下午4:04」「上午 9:20」「晚上8:30」。复合词排在单字「早/晚」前，
+# 避免「早上7:30」被单字分支抢走。
+_CN_PERIOD_TIME = re.compile(
+    r"(凌晨|清晨|早上|上午|中午|下午|傍晚|晚上|深夜|早|晚)\s*([01]?\d|2[0-3])[:：]([0-5]\d)"
+)
+
+# 纯 HH:MM（无日期/时段前缀）：尾断言 `(?![\d:：])` 挡三冒号时长「00:24:52」的
+# 内层子串「00:24」；小时上限 23 天然排除「40:16」这类分:秒时长。
+_BARE_HHMM = re.compile(r"(?<![\d午])([01]?\d|2[0-3])[:：]([0-5]\d)(?![\d:：])")
+
+
+def _cn_period_hour(period: str, h: int) -> int:
+    """中文时段词 → 24 小时制小时（「下午4:04」→16；「下午12:30」→12）。"""
+    if period in ("凌晨", "深夜"):
+        return 0 if h == 12 else h
+    if period in ("中午", "下午", "傍晚", "晚上", "晚"):
+        return h if h == 12 else h + 12
+    return h  # 清晨/早上/上午/早
+
+
+def _near_duration_label(items, it) -> bool:
+    """框紧邻时长类标签（「训练时长」「运动时间」等）→ 是时长值而非开始时间。"""
+    for other in items:
+        if other is it:
+            continue
+        if not any(
+            kw in other["text"]
+            for kw in ("时长", "运动时间", "运动时长", "活动时间", "duration", "elapsed")
+        ):
+            continue
+        if abs(other["cy"] - it["cy"]) <= 40 and abs(other["cx"] - it["cx"]) <= 350:
+            return True
+    return False
+
+
+def extract_workout_time(result) -> tuple[int, int] | None:
+    """从 OCR 框结果提取运动开始时间 ``(hour, minute)``；识别不出返回 None。
+
+    优先级：
+      1. 日期+时间组合（「9月25日 07:32」）——详情页开始时间的最强信号；
+      2. 中文时段+时间（「下午4:04」）；
+      3. 纯 HH:MM 兜底：只认页面顶部 1/4 的框、且不紧邻时长标签——「40:16」
+         这类分:秒时长与开始时间同形，靠位置与上下文区分。
+    """
+    if not result:
+        return None
+    items = _iter_items(result)
+    if not items:
+        return None
+    max_y = max(it["cy"] for it in items)
+    for it in items:
+        m = _DATETIME_WITH_TIME.search(it["text"])
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    for it in items:
+        m = _CN_PERIOD_TIME.search(it["text"])
+        if m:
+            return _cn_period_hour(m.group(1), int(m.group(2))), int(m.group(3))
+    for it in items:
+        if it["cy"] > max_y * 0.25:
+            continue
+        if _near_duration_label(items, it):
+            continue
+        m = _BARE_HHMM.fullmatch(it["text"].strip())
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def extract_workout_time_text(text: str) -> tuple[int, int] | None:
+    """纯文本版运动开始时间提取（无坐标时的兜底，规则同 extract_workout_time）。
+
+    纯 HH:MM 无坐标可判位置，只接受「全文唯一」一个候选（不带日期前缀）——
+    出现多个时刻说明是列表页或含时长，交给框坐标版或放弃。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _DATETIME_WITH_TIME.search(t)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = _CN_PERIOD_TIME.search(t)
+    if m:
+        return _cn_period_hour(m.group(1), int(m.group(2))), int(m.group(3))
+    found = None
+    for m in _BARE_HHMM.finditer(t):
+        if _is_datetime_prefix(t[: m.start()]):
+            continue
+        if found is not None:
+            return None  # 多个候选 → 无法确定哪个是开始时间
+        found = (int(m.group(1)), int(m.group(2)))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +913,17 @@ def sanitize_activity(data: dict) -> tuple[dict, str | None]:
         if not (_MIN_KCAL_PER_KM <= kcal_per_km <= _MAX_KCAL_PER_KM):
             cleaned.pop("calories", None)
 
+    # 爬升 vs 距离交叉校验：截图距离常以米显示（校园跑「2099m」），OCR/视觉偶发
+    # 把距离值误当成爬升——此时爬升恰好等于 距离(km)×1000。真实运动里 1 km 对应
+    # 1000 m 爬升 = 全程约 45° 坡度，跑步/徒步不可能（数据修复时实测两起：
+    # 2.1 km→2099 m、3.26 km→3263 m）。按 1% 容差直接丢弃爬升，
+    # 宁可缺爬升也不污染爬升排行（该字段非核心，缺失只在回显里不显示）。
+    if cleaned.get("ascent_meters") and cleaned.get("distance_km"):
+        ascent = cleaned["ascent_meters"]
+        dist_m = cleaned["distance_km"] * 1000
+        if abs(ascent - dist_m) <= max(1.0, dist_m * 0.01):
+            cleaned.pop("ascent_meters", None)
+
     return cleaned, reject
 
 
@@ -875,3 +1009,54 @@ def find_field_conflicts(a: dict, b: dict) -> list[str]:
         if abs(va - vb) / denom > ratio:
             conflicts.append(key)
     return conflicts
+
+
+# ---------------------------------------------------------------------------
+# 同日数据指纹判重：同一场运动换了张截图（详情页 vs 分享卡片、不同 App 同一次）
+# 数值几乎一致 → 判为同一场，不重复累计；同一天两场真实运动数值不同，各自记录。
+# ---------------------------------------------------------------------------
+
+
+def _close_enough(va, vb, rel: float, abs_tol: float) -> bool:
+    """两值是否足够接近：绝对差 ≤ max(绝对容差, 相对容差×较大值)。"""
+    try:
+        va, vb = float(va), float(vb)
+    except (ValueError, TypeError):
+        return False
+    return abs(va - vb) <= max(abs_tol, max(abs(va), abs(vb)) * rel)
+
+
+def same_workout_fields(a: dict, b) -> bool:
+    """判断两份解析数据是否为「同一场运动」的数值指纹（供同日截图判重）。
+
+    判据刻意保守（宁可漏判重、也不误伤同一天两场真实运动）：
+      - 距离为必要条件：两侧都有且相对差 ≤1%（绝对差 ≤0.03 km）——OCR 抖动范围；
+      - 至少再一个可比字段（时长/消耗/爬升/配速/心率）两侧都有且接近；
+      - 参与比较的字段必须**全部**通过——任一项显著不同即判不同场；
+      - 只有距离一个可比字段时不判同场（两场距离接近的真实运动不能只靠距离合并）。
+    ``b`` 支持 dict 或带同名属性的对象（CheckinLog 等）。
+    """
+
+    def _g(d, k):
+        return d.get(k) if isinstance(d, dict) else getattr(d, k, None)
+
+    da, db = _g(a, "distance_km"), _g(b, "distance_km")
+    if not da or not db:
+        return False
+    if not _close_enough(da, db, 0.01, 0.03):
+        return False
+    compared = 0
+    for key, rel, abs_tol in (
+        ("active_minutes", 0.03, 2.0),
+        ("calories", 0.05, 15.0),
+        ("ascent_meters", 0.08, 10.0),
+        ("avg_pace_sec_per_km", 0.04, 8.0),
+        ("avg_hr", 0.03, 4.0),
+    ):
+        va, vb = _g(a, key), _g(b, key)
+        if not va or not vb:
+            continue
+        compared += 1
+        if not _close_enough(va, vb, rel, abs_tol):
+            return False
+    return compared >= 1

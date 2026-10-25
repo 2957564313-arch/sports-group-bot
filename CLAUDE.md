@@ -136,6 +136,42 @@ https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or
 
 ---
 
+### 3.3 —— 测试突然失败：`DLL load failed ... 应用程序控制策略已阻止此文件`
+
+**现象**
+
+`.venv` 跑 pytest 时 conftest 导入 sqlalchemy 即崩：
+
+```
+ImportError: DLL load failed while importing _immutabledict_cy:
+应用程序控制策略已阻止此文件。
+```
+
+2026-10-18 时同一 `.venv` 还能全量 154 passed，10-20 突然失败，中间未改任何依赖。
+
+**根因**
+
+两天的间隔里系统更新打开了 **Smart App Control（智能应用控制）**：`Get-MpComputerStatus` 的 `SmartAppControlState=On`，WDAC 状态 2（强制）。SAC 按文件哈希拦截未签名二进制，而 PyPI 的 Cython 扩展 `.pyd` 全部无签名。典型 SAC 逐文件决策：同一个 wheel 里 `_collections_cy.pyd` 放行、`_immutabledict_cy.pyd` 被拦。
+
+**排除投毒**
+
+- `pip install --force-reinstall` 后仍被拦 → 拦的是文件内容哈希，与文件新旧无关；
+- 从官方 pypi.org 下载 `sqlalchemy-2.1.4-cp313-cp313-win_amd64.whl` 解包比对，被拦文件与官方原件 SHA256 一致（`17F3F0EE…`）→ 文件合法，SAC 误拦。
+
+**处置**
+
+Windows 安全中心 → 应用和浏览器控制 → 智能应用控制 → 关闭。
+
+**验证**
+
+`import sqlalchemy` 通过，全量 154 passed。
+
+**注意**
+
+SAC 关闭后**不可再开启**（除非重置系统）。开发机上未签名的 PyPI 原生扩展会被 SAC 随机误拦，保持关闭是正解；若再遇此类报错，先查 `(Get-MpComputerStatus).SmartAppControlState`。
+
+---
+
 ## 4. 维护注意事项
 
 1. **重装必须带 `--allow-scripts`**：npm 11.19 会对未显式授权的安装脚本告警，而 Claude Code 完全依赖 `postinstall` 铺放原生二进制。不带此参数会重现 3.1 的故障。
@@ -237,3 +273,23 @@ cd "C:\Users\508\Desktop\甲壳虫"
 > .venv\Scripts\python.exe -c "import sys, sqlalchemy; print(sys.version.split()[0], sqlalchemy.__version__)"
 > ```
 
+
+---
+
+## 8. 操作日志（2026-10-26）
+
+本轮优化主题：图片识别精度（同一天不同时间段的运动准确区分和记录）+ 群内交互亲切化。
+
+| # | 操作 | 结果 |
+| --- | --- | --- |
+| 1 | 排查同日多次截图现状：md5/dHash 判重只认「同一张图」，同一场运动换张截图（详情页/分享卡片/不同 App）会重复累计；两场真实运动虽会各自记录，但回复不区分「第几次」 | 确认缺口 |
+| 2 | `parsers.extract_workout_time`：提取详情页运动开始时间（日期+时间组合、中文时段「下午4:04」、顶部 HH:MM 兜底；排除时长标签旁与非法时刻） | 辅助信号就位 |
+| 3 | `CheckinLog` 加 `start_minute` 列（0 点起分钟数，可空）+ `db._MIGRATIONS` 补列迁移；`sync.log_checkin` 落库该字段 | 旧库模拟验证：补列、旧数据兼容、ORM 读写 OK |
+| 4 | 同日数据指纹判重 `parsers.same_workout_fields` + `sync.find_duplicate_workout`：距离（±1%/0.03km）+ 至少一个辅助字段一致 → 同一场运动不重复落库；两侧都识别出时间且差 >20 分钟 → 判为两场。写库前拦截，判重不 `_mark_seen`（删除打卡后可用此图重记） | 同场换图不重复累计，两场各自记录 |
+| 5 | 「今日」当日 ≥2 次截图时逐条列出（时段称呼或「第 N 次」）；管理员「打卡记录」带时段 | 多场运动可核对 |
+| 6 | 交互亲切化：回复带头像昵称称呼；`cheers.opener` 支持时段开场（「清晨的 5.2 km，收下啦！」）；第 2 次起「一天两练」类专属文案；判重回复解释原因；失败回复更友好 | 截图链路文案升级 |
+| 7 | 修 `tests/test_diagnose.py` 日期漂移（写死 2026-10-18 的两个测试改相对日期；其余 load_status 测试保留固定日期） | 全量恢复绿色 |
+| 8 | 新增测试：时间提取 8 例、数据指纹判重 5 例、落库时间 1 例、cheers 时段 3 例 | 全量 182 passed，ruff 全过 |
+| 9 | 上轮遗留（爬升误读修复 no_unit_box/_used/爬升-距离交叉校验、月历命令、COROS 授权吊销提醒 notify 服务）随本轮一并提交 | 见 commit |
+
+> 判重权衡记录：数据指纹判重刻意保守——只有距离一个可比字段不判重；两场真实运动数值若恰好落在 OCR 抖动区间内且都未识别出时间，会被误判为同一场（可「删除打卡」后重发修正）。宁可误判重（用户可见、可修）也不误合并（两场漏记、用户无感知）。

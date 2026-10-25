@@ -14,7 +14,7 @@ from nonebot.log import logger
 from ..config import settings
 from ..db import get_session
 from ..models.member import Member
-from . import activity, alert, checkin, ranking, retention, sync, timeutil
+from . import activity, alert, checkin, notify, ranking, retention, sync, timeutil
 
 driver = get_driver()
 
@@ -175,19 +175,54 @@ async def _daily_broadcast_loop() -> None:
 _started = False
 # 持有播报循环任务的强引用，避免常驻协程被 GC 回收导致每日播报静默失效
 _broadcast_task: asyncio.Task | None = None
+# 成员提醒循环任务引用（同上）
+_notify_task: asyncio.Task | None = None
+
+
+async def _member_notify_loop() -> None:
+    """周期抽取 services.notify 里的成员提醒并私聊发送（同 qq 24h 去重）。
+
+    独立于每日播报循环：授权失效等账号级故障需要尽快通知成员本人——
+    等 23:00 播报搭车太迟（当天数据已经缺失，成员越晚重新绑定缺得越多）。
+    无可用 Bot 或发送失败时放回队列重试（限次），不静默丢弃。
+    """
+    while True:
+        await asyncio.sleep(30)
+        items = notify.drain()
+        if not items:
+            continue
+        try:
+            bots, _ = await activity.resolve_targets()
+        except Exception as e:
+            logger.warning(f"解析成员通知发送目标失败: {e}")
+            bots = []
+        if not bots:
+            # 没有已连接的 Bot：放回队列，等连接恢复后再发
+            for qq, text, left in items:
+                notify.retry(qq, text, left)
+            continue
+        for qq, text, left in items:
+            try:
+                await bots[0].send_private_msg(user_id=int(qq), message=text)
+                logger.info(f"已私聊通知成员 {qq}（账号级提醒）")
+            except Exception as e:
+                logger.warning(f"私聊通知成员 {qq} 失败: {e}")
+                notify.retry(qq, text, left)
 
 
 def start_scheduler() -> None:
-    """在 driver on_startup 阶段调用，启动每日排行播报循环。
+    """在 driver on_startup 阶段调用，启动每日排行播报循环与成员提醒循环。
 
     幂等：若 on_startup 被重复触发，也只创建一次循环任务，避免每天 23:00 重复播报。
     """
-    global _started, _broadcast_task
+    global _started, _broadcast_task, _notify_task
     if _started:
         logger.warning("调度器已启动，跳过重复启动")
         return
     _started = True
-    _broadcast_task = asyncio.get_running_loop().create_task(_daily_broadcast_loop())
+    loop = asyncio.get_running_loop()
+    _broadcast_task = loop.create_task(_daily_broadcast_loop())
+    _notify_task = loop.create_task(_member_notify_loop())
     logger.info(
         f"每日排行播报已启动（每天 {settings.broadcast_hour:02d}:{settings.broadcast_minute:02d}）"
     )

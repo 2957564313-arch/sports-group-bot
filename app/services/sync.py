@@ -14,7 +14,7 @@ from ..models.checkin_log import CheckinLog
 from ..models.daily_record import DailyRecord
 from ..models.manual_distance import ManualDistance
 from ..models.member import Member
-from . import checkin, timeutil
+from . import checkin, parsers, timeutil
 from .providers import get_provider
 from .providers.base import DailyStats
 
@@ -139,9 +139,12 @@ def log_checkin(
     ascent_meters: float = 0.0,
     calories: int = 0,
     active_minutes: int = 0,
+    start_minute: int | None = None,
 ) -> None:
     """记录一次截图打卡的明细（供「删除最近一次打卡」精确回退）。
 
+    start_minute 为截图识别的运动开始时间（0 点起分钟数，None=未识别），
+    供同日判重区分「数据相同的两场运动」与「今日明细」时段展示。
     只 flush 不 commit，理由同 add_manual_distance：截图写库路径单事务。
     """
     session.add(
@@ -152,9 +155,38 @@ def log_checkin(
             ascent_meters=ascent_meters,
             calories=calories,
             active_minutes=active_minutes,
+            start_minute=start_minute,
         )
     )
     session.flush()
+
+
+# 同日判重的「开始时间冲突」阈值：两侧都识别出时间且相差超过该分钟数，
+# 视为两场不同运动（同一天两场数据恰好相同的运动靠时间区分）。
+_WORKOUT_TIME_CONFLICT_MIN = 20
+
+
+def find_duplicate_workout(
+    data: dict, start_minute: int | None, logs: list[CheckinLog]
+) -> CheckinLog | None:
+    """在当天截图打卡明细中找「同一场运动」的记录，找不到返回 None。
+
+    两重判据（同时满足才算重复）：
+      1. 数值指纹一致（距离 + 至少一个辅助字段，见 parsers.same_workout_fields）；
+      2. 开始时间不冲突：两侧都识别出时间且相差 >20 分钟 → 判为两场不同运动。
+    供截图写库前调用：命中则不落库，避免同一场运动换张截图
+    （详情页 / 分享卡片 / 不同 App 同一次）被重复累计。
+    """
+    for lg in logs:
+        if (
+            lg.start_minute is not None
+            and start_minute is not None
+            and abs(lg.start_minute - start_minute) > _WORKOUT_TIME_CONFLICT_MIN
+        ):
+            continue
+        if parsers.same_workout_fields(data, lg):
+            return lg
+    return None
 
 
 def _undo_checkin_log(session: Session, log: CheckinLog) -> tuple[float, date]:

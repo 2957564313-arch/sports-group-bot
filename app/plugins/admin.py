@@ -18,7 +18,7 @@ from ..models.checkin_log import CheckinLog
 from ..models.group import Group
 from ..models.manual_distance import ManualDistance
 from ..models.member import Member
-from ..services import checkin, credentials, sync, timeutil
+from ..services import checkin, cheers, credentials, sync, timeutil
 from ..services.member import get_or_create_member, normalize_nickname
 from ..services.permission import is_superuser
 from ..services.providers import VALID_PLATFORMS, get_provider
@@ -445,9 +445,12 @@ async def handle_checkin_logs(bot: Bot, event: MessageEvent, args: Message = Com
         await checkin_logs_cmd.finish(f"{name}（QQ {qq}）没有截图打卡记录")
     lines = [f"📋 {name}（QQ {qq}）的截图打卡记录（最近 {len(logs)} 条）", "━━━━━━━━━━━━"]
     for lg in logs:
-        lines.append(
-            f"· #{lg.id}  {lg.record_date.month}月{lg.record_date.day}日  {lg.distance_km:.2f} km"
-        )
+        period = cheers.day_period(lg.start_minute)
+        line = f"· #{lg.id}  {lg.record_date.month}月{lg.record_date.day}日"
+        if period:
+            line += f" {period}"
+        line += f"  {lg.distance_km:.2f} km"
+        lines.append(line)
     lines.append(f"发「删除打卡记录 {qq} 记录号」删除指定一条")
     await checkin_logs_cmd.finish("\n".join(lines))
 
@@ -500,6 +503,7 @@ _ADMIN_HELP = (
     "· 活动列表 [YYYY-MM] —— 查看活动\n"
     "· 删除活动 名称 日期 —— 删除手动活动 / 取消固定活动\n"
     "· 预览月历 —— 预览下月跑团日历\n"
+    "· 月历 YYYY-MM —— 查看任意月跑团日历（2026-10 起）\n"
     "· 补录截图 —— 补录今天群里未记录的截图\n"
     "· 管理员命令 —— 查看本列表"
 )

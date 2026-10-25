@@ -23,4 +23,7 @@ class CheckinLog(Base):
     ascent_meters: Mapped[float] = mapped_column(Float, default=0.0)
     calories: Mapped[int] = mapped_column(Integer, default=0)
     active_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    # 截图识别的运动开始时间（从 0 点起的分钟数；None=未识别）。
+    # 供同日判重区分「同一天两场数据相同的运动」与「今日明细」的时段展示。
+    start_minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

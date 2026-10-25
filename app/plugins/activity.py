@@ -5,6 +5,7 @@
 - 活动列表 [YYYY-MM]                列出活动（含已取消的固定活动标记）
 - 删除活动 名称 日期 [地点]         删手动活动；或取消某天固定活动（例训/例跑）
 - 删除活动 活动id                   按 id 删除
+- 月历 YYYY-MM                      查看任意月月历图（2026-10 及以后）
 
 固定活动：每周三「例训」16:00、每周五「例跑」20:00，默认西北田径场，自动出现在每月日历，
 不参与前一天提醒；手动活动同日覆盖固定活动。
@@ -29,6 +30,7 @@ list_cmd = on_command("活动列表", aliases={"活动"}, priority=5, block=True
 add_cmd = on_command("添加活动", aliases={"新增活动"}, priority=5, block=True)
 del_cmd = on_command("活动删除", aliases={"删除活动"}, priority=5, block=True)
 preview_cmd = on_command("预览月历", aliases={"月历预览"}, priority=5, block=True)
+month_cmd = on_command("月历", aliases={"查看月历"}, priority=5, block=True)
 
 # 时间片段：16:00 / 16：00 / 16点 / 16点半 / 16点30分
 _TIME_RE = re.compile(r"(\d{1,2}[:：]\d{2}|\d{1,2}点(?:半|\d{1,2}分)?)")
@@ -274,3 +276,28 @@ async def handle_preview(bot: Bot, event: MessageEvent):
         logger.warning(f"发送预览月历失败: {e}")
         await preview_cmd.finish(f"发送失败：{e}")
     await preview_cmd.finish()
+
+
+@month_cmd.handle()
+async def handle_month(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    if not is_superuser(event):
+        await month_cmd.finish("仅管理员可执行")
+    arg = _arg(args)
+    m = re.fullmatch(r"(\d{4})[-./年](\d{1,2})月?", arg)
+    if not m or not 1 <= int(m.group(2)) <= 12:
+        await month_cmd.finish("用法：月历 YYYY-MM（如 月历 2026-11）")
+    y, mo = int(m.group(1)), int(m.group(2))
+    if (y, mo) < (2026, 10):
+        await month_cmd.finish()  # 2026-10 之前无活动数据，按约定不回应
+    try:
+        path = build_calendar_image(y, mo)
+    except Exception as e:
+        logger.warning(f"生成 {y}-{mo:02d} 月历失败: {e}")
+        await month_cmd.finish("生成月历失败，请稍后再试")
+    msg = MessageSegment.image(file=path)
+    try:
+        await bot.send(event, msg)
+    except Exception as e:
+        logger.warning(f"发送 {y}-{mo:02d} 月历失败: {e}")
+        await month_cmd.finish(f"发送失败：{e}")
+    await month_cmd.finish()

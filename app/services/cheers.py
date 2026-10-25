@@ -113,8 +113,14 @@ def _calorie_note(kcal: int) -> str:
     return ""
 
 
-def opener(data: dict) -> str:
-    """按数据选一句开场（无数据时退回通用池，偶尔带时段问候）。"""
+def opener(data: dict, period: str = "") -> str:
+    """按数据选一句开场（无数据时退回通用池，偶尔带时段问候）。
+
+    ``period``：截图识别的运动开始时段（「清晨」「晚上」等，见 day_period），
+    有距离时优先用它打招呼——比通用开场更贴切（「清晨的 5.2 km，收下啦！」）。
+    """
+    if period and data.get("distance_km"):
+        return f"{period}的 {data['distance_km']} km，收下啦！"
     note = (
         _distance_note(data.get("distance_km", 0))
         or _pace_note(data.get("avg_pace_sec_per_km", 0))
@@ -126,6 +132,40 @@ def opener(data: dict) -> str:
     if random.random() < 0.4:
         return _greeting()
     return random.choice(_OPENERS)
+
+
+def day_period(start_minute: int | None) -> str:
+    """把「从 0 点起的分钟数」翻译成口语时段称呼；None/未知返回空串。
+
+    供截图回复与「今日明细」「打卡记录」复用，统一同一场运动的口头叫法。
+    """
+    if start_minute is None:
+        return ""
+    h = start_minute // 60
+    if 4 <= h < 9:
+        return "清晨"
+    if 9 <= h < 12:
+        return "上午"
+    if 12 <= h < 14:
+        return "中午"
+    if 14 <= h < 18:
+        return "下午"
+    if 18 <= h < 21:
+        return "傍晚"
+    if 21 <= h < 24:
+        return "晚上"
+    return "深夜"
+
+
+def multi_session_note(count: int) -> str:
+    """当天第 N 次运动的专属文案（第 2 次起才有；第 1 次不硬夸）。"""
+    if count == 2:
+        return "🌗 今天第 2 次运动啦，一天两练，双倍自律！"
+    if count == 3:
+        return "🌗 今天第 3 次运动，铁人作息，respect！"
+    if count >= 4:
+        return f"🌗 今天第 {count} 次运动……你卷得机器人都不好意思了！"
+    return ""
 
 
 def closer(data: dict) -> str:
