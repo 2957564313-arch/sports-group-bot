@@ -1,7 +1,7 @@
 """打卡查询：打卡 查看自己的累计/本月打卡天数。
 
 礼物（第 GIFT_DAYS 天）不再靠手动「领礼物」，改为在截图/今日路径跨过里程碑时
-自动领取并通知团长（见 services.checkin.auto_gift 与 query.py / image_ocr.py）。
+自动领取并通知管理员（见 services.checkin.auto_gift 与 query.py / image_ocr.py）。
 """
 
 from datetime import timedelta

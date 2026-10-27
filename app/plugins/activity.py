@@ -1,13 +1,13 @@
 """活动管理命令（仅管理员，且不进任何帮助/提示文案，命令本身不对外暴露）。
 
 管理员私下记录跑团活动，机器人据此自动发下月日历图 + 活动前一天提醒：
-- 添加活动 名称 日期 [时间] 地点    例：添加活动 接力长城 10月7日 浙水院
+- 添加活动 名称 日期 [时间] 地点    例：添加活动 周末拉练 10月7日 城市公园
 - 活动列表 [YYYY-MM]                列出活动（含已取消的固定活动标记）
-- 删除活动 名称 日期 [地点]         删手动活动；或取消某天固定活动（例训/例跑）
+- 删除活动 名称 日期 [地点]         删手动活动；或取消某天固定活动
 - 删除活动 活动id                   按 id 删除
-- 月历 YYYY-MM                      查看任意月月历图（2026-10 及以后）
+- 月历 YYYY-MM                      查看任意月月历图
 
-固定活动：每周三「例训」16:00、每周五「例跑」20:00，默认西北田径场，自动出现在每月日历，
+固定活动由 .env 的 WEEKLY_EVENTS 配置（如每周三例训、每周五例跑），自动出现在每月日历，
 不参与前一天提醒；手动活动同日覆盖固定活动。
 """
 
@@ -23,7 +23,7 @@ from sqlalchemy import select
 from ..db import get_session
 from ..models.activity import Activity
 from ..services import timeutil
-from ..services.activity import WEEKLY_EVENTS, build_calendar_image
+from ..services.activity import build_calendar_image, weekly_events
 from ..services.permission import is_superuser
 
 list_cmd = on_command("活动列表", aliases={"活动"}, priority=5, block=True)
@@ -158,7 +158,7 @@ def _next_month(d: date) -> date:
 
 
 async def _del_name_date(name: str, d: date, location: str) -> None:
-    """删除某天活动：优先删手动活动；无手动活动且是固定活动（例训/例跑）则取消该天。"""
+    """删除某天活动：优先删手动活动；无手动活动且是固定活动则取消该天。"""
     session = get_session()
     try:
         acts = list(
@@ -178,8 +178,9 @@ async def _del_name_date(name: str, d: date, location: str) -> None:
             session.commit()
             await del_cmd.finish(f"✅ 已删除活动「{name}」（{d}）")
 
+        weekly = weekly_events()
         wd = d.weekday()
-        if wd in WEEKLY_EVENTS and WEEKLY_EVENTS[wd].name == name:
+        if wd in weekly and weekly[wd].name == name:
             dup = (
                 session.execute(
                     select(Activity).where(
@@ -191,7 +192,7 @@ async def _del_name_date(name: str, d: date, location: str) -> None:
             )
             if dup:
                 await del_cmd.finish(f"「{name}」（{d}）已是取消状态")
-            loc = location or WEEKLY_EVENTS[wd].location
+            loc = location or weekly[wd].location
             session.add(Activity(kind="cancel", name=name, date=d, time="", location=loc))
             session.commit()
             await del_cmd.finish(f"⛔ 已取消 {d} 的固定活动「{name}」")

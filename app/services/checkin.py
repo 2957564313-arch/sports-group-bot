@@ -1,9 +1,9 @@
 """打卡体系：天数统计 / 里程碑 / 节日彩蛋 / 群抽奖 / 礼物，全数据驱动、可泛化。
 
-统一口径（与用户确认）：
+统一口径：
   - 打卡单位 = 天：同一成员同一天多次运动/截图只算 1 天；
   - 覆盖范围 = 绑定平台 + 截图：绑定 Garmin/COROS 当天有平台数据即算，未绑定发截图算；
-  - 计数起点 = SEMESTER_START（默认 2026-09-20）：之前的记录不统计。
+  - 计数起点 = SEMESTER_START（默认 1970-01-01 = 统计全部历史，可按需改为学期/活动起始日）：之前的记录不统计。
 
 数据源是 CheckinDay 表（每成员每天一行，永不清理）。触发幂等靠 CheckinState 表，
 重复打卡/重复查询不会重复发彩蛋。所有触发规则数据驱动，加新能力只改本文件顶部常量、
@@ -32,8 +32,11 @@ GIFT_QUOTA = 10  # 全群先到先得名额（满足条件先后顺序，满额�
 
 # —— 群抽奖：全群累计打卡天数突破这些值时触发一次（每次抽 LOTTERY_WINNERS 名）——
 LOTTERY_THRESHOLDS = [200, 400]
-LOTTERY_PRIZE = "小红书赞助的帽子"
+LOTTERY_PRIZE = settings.lottery_prize  # 奖品名称（.env 的 LOTTERY_PRIZE，可自行定制）
 LOTTERY_WINNERS = 1
+
+# —— 第 GIFT_DAYS 天礼物的展示名称（.env 的 GIFT_NAME，去掉硬编码的群专属内容）——
+GIFT_NAME = settings.gift_name
 
 # —— 节日 + 特殊距离彩蛋：日期命中且打卡距离≈对应 km 时触发（date=(月,日)）——
 FESTIVALS = [
@@ -46,7 +49,7 @@ FESTIVAL_DIST_TOL = 0.05  # 距离匹配容差（km）
 
 
 def counting_start() -> date:
-    """打卡计数起点（本学期起点）。之前的记录不统计。"""
+    """打卡计数起点（SEMESTER_START）。之前的记录不统计。"""
     try:
         return date.fromisoformat(settings.semester_start)
     except ValueError:

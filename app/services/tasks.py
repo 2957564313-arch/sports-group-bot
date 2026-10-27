@@ -91,7 +91,7 @@ async def _run_broadcast() -> None:
     # 先于群播报发出，让管理员第一时间察觉「数据可能悄悄缺失」。同 key 去重见 services.alert。
     alerts = alert.drain()
     if alerts and bots:
-        text = "⚠️ 甲壳虫运维提醒\n" + "\n".join(alerts)
+        text = f"⚠️ {settings.bot_name}运维提醒\n" + "\n".join(alerts)
         for su in get_driver().config.superusers:
             for bot in bots:
                 try:
@@ -164,12 +164,21 @@ async def _daily_broadcast_loop() -> None:
     hour = settings.broadcast_hour
     minute = settings.broadcast_minute
     while True:
-        now = timeutil.now()
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if now >= target:
-            target += datetime.timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        await _run_broadcast()
+        try:
+            now = timeutil.now()
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if now >= target:
+                target += datetime.timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+            await _run_broadcast()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 常驻循环绝不允许被未预期异常杀死（否则每日播报静默失效、且无任何告警）。
+            # 登记运维告警（同 key 去重限频）后 60 秒重试，恢复后循环照常运转。
+            logger.exception(f"每日播报循环异常: {e}")
+            alert.record("broadcast_loop", f"每日播报循环异常：{e}")
+            await asyncio.sleep(60)
 
 
 _started = False
@@ -188,26 +197,33 @@ async def _member_notify_loop() -> None:
     """
     while True:
         await asyncio.sleep(30)
-        items = notify.drain()
-        if not items:
-            continue
         try:
-            bots, _ = await activity.resolve_targets()
-        except Exception as e:
-            logger.warning(f"解析成员通知发送目标失败: {e}")
-            bots = []
-        if not bots:
-            # 没有已连接的 Bot：放回队列，等连接恢复后再发
-            for qq, text, left in items:
-                notify.retry(qq, text, left)
-            continue
-        for qq, text, left in items:
+            items = notify.drain()
+            if not items:
+                continue
             try:
-                await bots[0].send_private_msg(user_id=int(qq), message=text)
-                logger.info(f"已私聊通知成员 {qq}（账号级提醒）")
+                bots, _ = await activity.resolve_targets()
             except Exception as e:
-                logger.warning(f"私聊通知成员 {qq} 失败: {e}")
-                notify.retry(qq, text, left)
+                logger.warning(f"解析成员通知发送目标失败: {e}")
+                bots = []
+            if not bots:
+                # 没有已连接的 Bot：放回队列，等连接恢复后再发
+                for qq, text, left in items:
+                    notify.retry(qq, text, left)
+                continue
+            for qq, text, left in items:
+                try:
+                    await bots[0].send_private_msg(user_id=int(qq), message=text)
+                    logger.info(f"已私聊通知成员 {qq}（账号级提醒）")
+                except Exception as e:
+                    logger.warning(f"私聊通知成员 {qq} 失败: {e}")
+                    notify.retry(qq, text, left)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 同播报循环：成员提醒循环也不允许静默死亡（授权失效通知会随之中断）。
+            logger.exception(f"成员提醒循环异常: {e}")
+            alert.record("notify_loop", f"成员提醒循环异常：{e}")
 
 
 def start_scheduler() -> None:

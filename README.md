@@ -1,58 +1,64 @@
-# 甲壳虫 —— QQ 群运动数据机器人
+# sports-group-bot —— QQ 群运动数据机器人
 
-一个长期在线的 QQ 群运动搭子，接入 Garmin / 高驰 COROS 运动平台，支持群内查询、排行播报、截图打卡、打卡体系（里程碑 / 礼物 / 抽奖 / 节日彩蛋），并用大模型（默认智谱 GLM-5.3-Flash）做数据解读与运动问答。
+一个长期在线的 QQ 群运动搭子：接入 Garmin / 高驰 COROS 运动平台，支持群内查询、排行播报、截图打卡、打卡体系（里程碑 / 礼物 / 抽奖 / 节日彩蛋），并用大模型做「说人话」的数据解读与运动问答。
+
+机器人名、群名单、打卡起点、固定活动、礼物文案等全部走 `.env` 配置，**代码零硬编码群专属内容**——fork 后改一份配置即可嫁接到自己的跑团 / 运动群。
 
 ## 功能特性
 
 - **多平台接入（每用户独立绑定）**：Garmin（佳明）按成员私聊填账号密码；高驰 COROS 走官方 OAuth 私密授权（不顶掉手机 App）；其余无开放接口的 App 靠**截图 OCR** 自动记录。
 - **数据查询**：今日 / 周数据 / 月数据 / 近30天 / 详细数据（逐日明细），含距离、配速、爬升、时长、消耗、心率、负荷等。
 - **三榜排行**：日榜 / 周榜 / 月榜，每晚 23:00 自动播报（周日追加周榜、月末追加月榜）。
-- **打卡体系**：累计打卡天数、里程碑彩蛋、第 100 天礼物（先到先得）、群抽奖、节日 + 特殊距离彩蛋，全部**条件触发、幂等、可泛化**；发「打卡」还能看到累计 / 本月天数与**下一个里程碑倒计时**。
-- **AI 增强层（默认 GLM-5.3-Flash）**：分析 / 鼓励我 / @我运动问答（结合本人数据上下文）/ 打卡点评。**LLM 只做锦上添花**，未配 key 或调用失败一律降级到确定性模板文案，机器人照常可用。
-- **活动播报（跑团日历）**：管理员私下维护跑团活动——每月末自动发下月「跑团日历」图（有活动的日期红圈标注 + 格内活动名），活动前一天 23:00 提醒。固定活动（每周三例训 16:00 / 每周五例跑 20:00，默认西北田径场）自动进日历，手动活动可覆盖、可取消某天固定活动。**命令对普通成员隐藏**。
+- **打卡体系**：累计打卡天数、里程碑彩蛋、第 100 天礼物（先到先得）、群抽奖、节日 + 特殊距离彩蛋，全部**条件触发、幂等、可泛化**；发「打卡」还能看到累计 / 本月天数与**下一个里程碑倒计时**。礼物与奖品名称、打卡起点均可配置。
+- **AI 增强层（默认 GLM-5.3-Flash，任意 OpenAI 兼容服务可换）**：分析 / 鼓励我 / @我运动问答（结合本人数据上下文）/ 打卡点评。**LLM 只做锦上添花**，未配 key 或调用失败一律降级到确定性模板文案，机器人照常可用。
+- **活动播报（跑团日历）**：管理员私下维护跑团活动——每月末自动发下月「跑团日历」图（有活动的日期红圈标注 + 格内活动名），活动前一天 23:00 提醒。每周固定活动（如周三例训 / 周五例跑）由 `WEEKLY_EVENTS` 配置自动进日历，手动活动可覆盖、可取消某天固定活动。**命令对普通成员隐藏**。
 - **群互动玩法**：抽奖、骰子、随机数、帮助菜单。
 
 ## 技术栈
 
-NoneBot2 + OneBot v11（NapCat）· SQLAlchemy + SQLite · RapidOCR（本地识别）· GLM-5.3-Flash（OpenAI 兼容）· Python 3.10+
+NoneBot2 + OneBot v11（NapCat）· SQLAlchemy + SQLite · RapidOCR（本地识别）· OpenAI 兼容大模型（默认智谱 GLM-5.3-Flash）· Python 3.10+
 
 ## 目录结构
 
 ```
-甲壳虫/
 ├── bot.py                  # 入口：初始化 NoneBot、注册 OneBot v11、加载插件、启动调度
 ├── pyproject.toml          # 项目元数据 + 依赖 + ruff 配置
 ├── .env.example            # 配置模板（复制为 .env 后填写）
 ├── .gitignore
 ├── LICENSE                 # MIT 开源协议
-├── 启动机器人.bat           # Windows 一键启动（切 UTF-8 后跑 bot.py）
+├── start.bat               # Windows 一键启动（切 UTF-8 后跑 bot.py）
 ├── README.md
 ├── PLAN.md                 # 架构设计与路线图
-└── app/
-    ├── config.py           # pydantic-settings 配置（读 .env）
-    ├── db.py               # SQLAlchemy 引擎 / 会话 / init_db
-    ├── models/             # ORM：Member / DailyRecord / CheckinDay / CheckinState 等
-    ├── services/
-    │   ├── providers/      # 平台适配层：base / garmin / coros
-    │   ├── sync.py         # 平台拉取 + 截图写入 + 历史回填
-    │   ├── ranking.py      # 日/周/月三榜聚合与格式化
-    │   ├── summary.py      # 个人周期汇总
-    │   ├── checkin.py      # 打卡体系：天数 / 里程碑 / 礼物 / 抽奖 / 节日彩蛋
-    │   ├── diagnose.py     # 训练诊断：负荷/恢复/配速趋势 + 比赛成绩算 VO₂max
-    │   ├── tasks.py        # 每日排行播报（调度器）
-    │   ├── activity.py     # 跑团日历图生成 + 活动前一天提醒
-    │   ├── retention.py    # 过期明细清理（保留 365 天）
-    │   ├── ocr.py          # RapidOCR 本地识别（数据不出本机）
-    │   ├── parsers.py      # 坐标关联解析 + 文本兜底
-    │   ├── cheers.py       # 鼓励语库 + 配速格式化
-    │   ├── llm.py          # 大模型增强层（GLM，总结/鼓励/建议/问答/点评）
-    │   ├── crypto.py       # 凭据加密存储（Fernet）
-    │   ├── credentials.py  # 每用户凭据 / token 存储
-    │   ├── member.py       # 成员创建 / 昵称清洗
-    │   └── timeutil.py     # 时区 / 日期工具
-    └── plugins/            # NoneBot 插件（命令入口）：activity / admin / checkin /
-                            #   diagnose / gate / group_tracker / history / image_ocr /
-                            #   interact / lottery / profile / query / ranking / summary
+├── app/
+│   ├── config.py           # pydantic-settings 配置（读 .env，含容错降级）
+│   ├── db.py               # SQLAlchemy 引擎 / 会话 / init_db / 补列迁移
+│   ├── models/             # ORM：Member / DailyRecord / CheckinDay / CheckinState 等
+│   ├── services/           # 业务逻辑层（与 NoneBot 解耦，可独立测试）
+│   │   ├── providers/      # 平台适配层：base / garmin / coros
+│   │   ├── sync.py         # 平台拉取 + 截图写入 + 历史回填
+│   │   ├── ranking.py      # 日/周/月三榜聚合与格式化
+│   │   ├── summary.py      # 个人周期汇总
+│   │   ├── checkin.py      # 打卡体系：天数 / 里程碑 / 礼物 / 抽奖 / 节日彩蛋
+│   │   ├── diagnose.py     # 训练诊断：负荷/恢复/配速趋势 + 比赛成绩算 VO₂max
+│   │   ├── tasks.py        # 每日排行播报（调度器，异常自恢复）
+│   │   ├── activity.py     # 跑团日历图生成 + 活动前一天提醒
+│   │   ├── retention.py    # 过期明细清理（保留 365 天 + WAL 压缩）
+│   │   ├── ocr.py          # RapidOCR 本地识别（数据不出本机）
+│   │   ├── parsers.py      # 坐标关联解析 + 文本兜底 + 合理性校验
+│   │   ├── cheers.py       # 鼓励语库 + 配速格式化
+│   │   ├── llm.py          # 大模型增强层（端点池故障转移 / 身份防泄露）
+│   │   ├── crypto.py       # 凭据加密存储（Fernet）
+│   │   ├── credentials.py  # 每用户凭据 / token 存储
+│   │   ├── guards.py       # 输入清洗 + 提示词注入拦截
+│   │   ├── net.py          # 内网/公网 TLS 分级校验
+│   │   ├── notify.py       # 成员账号级提醒（24h 去重 + 失败重试）
+│   │   ├── alert.py        # 运维告警（搭每日播报私聊管理员）
+│   │   ├── member.py       # 成员创建 / 昵称清洗
+│   │   └── timeutil.py     # 时区 / 日期工具
+│   └── plugins/            # NoneBot 插件（命令入口）：activity / admin / checkin /
+│                           #   gate / group_tracker / history / image_ocr /
+│                           #   interact / lottery / profile / query / ranking / summary
+└── tests/                  # pytest 单元测试（纯函数为主，不触网）
 ```
 
 ## 快速开始（本地）
@@ -68,7 +74,7 @@ copy .env.example .env          # Linux/macOS: cp .env.example .env
 # 编辑 .env，至少把你的 QQ 号填到 SUPERUSERS（运动平台为成员自行绑定，无需填账号密码）
 
 # 3. 启动 NapCat（见下），然后运行机器人
-python bot.py                   # 或双击 启动机器人.bat
+python bot.py                   # 或双击 start.bat
 ```
 
 > 首次调用 OCR 时会初始化 RapidOCR 引擎（加载模型），稍慢属正常。
@@ -105,13 +111,13 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 
 ## AI 能力（默认 GLM-5.3-Flash，可选增强层）
 
-在 `.env` 填 `LLM_API_KEY`（默认模型 `glm-5.3-flash`）即可启用。设计上 LLM **只进增强层、不进核心数据链路**：
+在 `.env` 填 `LLM_API_KEY` 即可启用。设计上 LLM **只进增强层、不进核心数据链路**：
 
 - OCR 识别、数据解析、排行聚合、平台同步全部走确定性代码；
 - 文本类能力（总结 / 鼓励 / 建议 / 问答 / 点评）只把「聚合后的数字」发给模型，不发送原始消息 / 账号密码；
 - 截图识图默认走本地 OCR；仅当 OCR 读不出核心字段（距离）时，才可能把截图发给视觉模型兜底（`LLM_VISION_ENABLED=false` 可彻底关闭，截图绝不上传云端）；
-- **模型池故障转移**：主端点失败（网络 / 5xx / key 失效 / 空内容）会自动切到下一端点，全部失败才降级模板——可配本地 Ollama 作兜底，**不依赖任何云端 key 也能跑**；
-- 未配 key 或调用失败一律降级到模板文案，机器人照常可用。
+- **模型池故障转移**：主端点失败（网络 / 5xx / key 失效 / 空内容）会自动切到下一个端点，全部失败才降级模板——可配本地 Ollama 作兜底，**不依赖任何云端 key 也能跑**；
+- 模型报出底层模型名 / 供应商名时由代码级「身份兜底」拦截替换，任何注入路径都无法套出模型信息。
 
 底层走 OpenAI 兼容接口，改 `LLM_BASE_URL` + `LLM_MODEL` 即可换成任意 OpenAI 兼容服务；备用端点用 `LLM_FALLBACKS` 配置（JSON 数组，示例见 `.env.example`）。
 
@@ -121,7 +127,7 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 
 - **打卡单位 = 天**：同一成员同一天多次运动 / 截图只算 1 天。
 - **覆盖范围 = 绑定 + 截图**：绑定 Garmin/COROS 当天有平台数据即算；未绑定发截图算。
-- **计数起点 = `SEMESTER_START`**（默认 `2026-09-20`，本学期开学日）：之前的记录不统计。
+- **计数起点 = `SEMESTER_START`**（默认 `1970-01-01` = 统计全部历史；按学期运行的群可改为开学日）：之前的记录不统计。
 
 围绕累计打卡天数挂载了几类**条件触发、只触发指定次数**的彩蛋：
 
@@ -133,8 +139,8 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 | 🎊 节日 + 特殊距离 | 国庆 10.01km / 元旦 1.01km / 五一 5.01km / 六一 6.01km | 每个成员每年每个节日一次 |
 
 - 所有触发幂等由 `checkin_state` 表保证，重复打卡 / 重复查询不会重复发彩蛋。
-- 礼物在成员跨过 100 天时**自动领取**并通知管理员（团长）安排发货，无需手动领取。
-- 加新彩蛋只需改 `app/services/checkin.py` 顶部的常量（`MILESTONES` / `GIFT_DAYS` / `LOTTERY_THRESHOLDS` / `FESTIVALS`），不改代码逻辑。
+- 礼物在成员跨过 100 天时**自动领取**并通知管理员安排发货，无需手动领取。
+- 礼物 / 奖品名称用 `GIFT_NAME` / `LOTTERY_PRIZE` 配置；加新彩蛋只需改 `app/services/checkin.py` 顶部的常量（`MILESTONES` / `GIFT_DAYS` / `LOTTERY_THRESHOLDS` / `FESTIVALS`），不改代码逻辑。
 
 发「打卡」可随时查看自己的累计 / 本月打卡天数。
 
@@ -146,7 +152,7 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 
 | 命令 | 说明 |
 |---|---|
-| `今日`（`今日运动` / `运动`） | 查询今日运动数据（含累计里程、本学期打卡次数） |
+| `今日`（`今日运动` / `运动`） | 查询今日运动数据（含累计里程、打卡次数） |
 | `周数据` / `月数据` / `近30天` | 查看个人周 / 月 / 近30天汇总（次数、跑量、爬升、负荷等） |
 | `详细数据 9月`（`历史` / `明细`） | 查任意时间段逐日训练明细 |
 
@@ -154,7 +160,7 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 
 | 命令 | 说明 |
 |---|---|
-| `分析`（可加 `月` / `5k 25:00`） | 三合一：数据总结 + 训练建议（结合诊断信号）+ 训练诊断（ACWR 与 EWMA 负荷比、CTL/ATL/TSB 负荷状态（TRIMP 或跑量基线）、单调性/训练应变（Foster 1998）、强度分布（极化训练检验）、心率区间 Z1~Z5、配速趋势）；结果较长**自动私发**；**只有提供比赛成绩（如 `分析 5k 25:00`）才计算 VO₂max / 成绩预测 / 训练配速**，裸分析结尾引导补充成绩 |
+| `分析`（可加 `月` / `5k 25:00`） | 三合一：数据总结 + 训练建议（结合诊断信号）+ 训练诊断（ACWR 与 EWMA 负荷比、CTL/ATL/TSB 负荷状态、单调性/训练应变、强度分布、心率区间 Z1~Z5、配速趋势）；结果较长**自动私发**；**只有提供比赛成绩（如 `分析 5k 25:00`）才计算 VO₂max / 成绩预测 / 训练配速**，裸分析结尾引导补充成绩 |
 | `鼓励我` | AI 按你的数据来一句鼓励 |
 | `@我 + 问题` | 运动知识问答（结合你的数据上下文），也能自然语言查数据（如「我今天跑了多少」「这周排行」） |
 
@@ -192,9 +198,9 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 
 | 命令 | 说明 |
 |---|---|
-| `添加活动 名称 日期 [时间] 地点` | 新增活动（例：`添加活动 接力长城 10月7日 浙水院`；日期支持 `10月7日` / `9.23` / `2026-10-05`，时间可选） |
+| `添加活动 名称 日期 [时间] 地点` | 新增活动（例：`添加活动 周末拉练 10月7日 城市公园`；日期支持 `10月7日` / `9.23` / `2026-10-05`，时间可选） |
 | `活动列表 [YYYY-MM]` | 列出活动（含已取消的固定活动标记） |
-| `删除活动 名称 日期 [地点]` | 删除手动活动，或取消某天固定活动（例训/例跑） |
+| `删除活动 名称 日期 [地点]` | 删除手动活动，或取消某天固定活动 |
 | `删除活动 活动id` | 按活动 id 删除 |
 | `预览月历` | 发送下个月的跑团日历图到当前群 |
 
@@ -208,6 +214,8 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 
 时间可在 `.env` 用 `BROADCAST_HOUR/BROADCAST_MINUTE` 调整。周榜/月榜由 `daily_record` 直接聚合，无需单独的周聚合任务。
 
+两个常驻调度循环（播报 / 成员提醒）都有**异常自恢复**：任何未预期异常只登记运维告警（私聊管理员）并自动重试，不会让定时任务静默死亡。
+
 ## 配置说明（.env）
 
 | 变量 | 默认 | 说明 |
@@ -215,21 +223,44 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | 反向 WebSocket 监听地址 |
 | `SUPERUSERS` | `["10001", "10002"]` | 管理员 QQ 号（JSON 数组，填你自己的） |
 | `COMMAND_START` | `["", "/"]` | 命令前缀 |
+| `BOT_NAME` | `运动搭子` | 机器人在群里的称呼（帮助菜单 / AI 人设 / 月历标题），改成自己群的名字即可 |
 | `DB_URL` | `sqlite:///data/bot.db` | 数据库连接 |
 | `BROADCAST_HOUR/MINUTE` | `23` / `0` | 每日排行播报时间 |
 | `BROADCAST_GROUPS` | `[]` | 显式播报群号；留空自动播报到所有出现过的群 |
 | `ALLOWED_GROUPS` | `[]` | 群使用白名单（JSON 数组）；留空 = 不限制（全群可用） |
 | `RETENTION_DAYS` | `365` | 原始训练明细保留天数（超过自动清除） |
-| `SEMESTER_START` | `2026-09-20` | 打卡计数起点（本学期开学日） |
+| `SEMESTER_START` | `1970-01-01` | 打卡计数起点（YYYY-MM-DD）；默认统计全部历史，按学期运行的群改为开学日 |
+| `GIFT_NAME` / `LOTTERY_PRIZE` | `惊喜小礼物` / `惊喜奖品` | 打卡第 100 天礼物与群抽奖奖品名称 |
+| `WEEKLY_EVENTS` | `[]` | 每周固定活动（JSON 数组，`weekday` 0=周一…6=周日）：自动进跑团月历，例见 `.env.example` |
 | `GARMIN_IS_CN` | `true` | 佳明中国区开关 |
 | `COROS_REGION` | `cn` | COROS 区域（cn / us） |
 | `LLM_API_KEY` | （空） | 大模型 key（默认智谱），留空自动禁用 AI 增强 |
 | `LLM_MODEL` | `glm-5.3-flash` | 模型名（OpenAI 兼容；原生多模态，文本 + 图片） |
-| `LLM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4/chat/completions` | 接口地址（OpenAI 兼容） |
+| `LLM_BASE_URL` | 智谱 chat/completions 全路径 | 接口地址（OpenAI 兼容） |
 | `LLM_REASONING_EFFORT` | （空） | 思考强度 `low`/`medium`/`max`；GLM 建议 `low`，留空则不下发该参数 |
 | `LLM_TIMEOUT` | `45` | 单次调用读超时（秒）；直连 GLM 建议 20~25 |
 | `LLM_VISION_ENABLED` | `true` | 识图兜底开关：本地 OCR 读不出距离 / 结果可疑时才把截图发给视觉模型；`false` = 只用本地 OCR，截图绝不上传云端 |
 | `LLM_FALLBACKS` | `[]` | 备用端点（JSON 数组）：主端点失败后按顺序切换，全部失败才降级模板；留空 = 只用主端点 |
+
+> JSON 数组类配置写错（漏逗号 / 形状不对）时**不会导致启动失败**：自动降级为默认值并在日志告警，机器人照常运行。
+
+## 嫁接到自己的群（定制清单）
+
+fork 本项目后，改一份 `.env` 即可完成定制，**无需改代码**：
+
+1. `BOT_NAME` —— 机器人在群里的称呼（AI 人设、帮助菜单、月历标题统一跟随）。
+2. `SUPERUSERS` —— 填自己的 QQ 号（管理员命令、运维告警私聊、礼物发货通知都依赖它）。
+3. `ALLOWED_GROUPS` —— 只让指定群使用（留空 = 不限）。
+4. `SEMESTER_START` —— 打卡计数起点（默认统计全部历史）。
+5. `WEEKLY_EVENTS` —— 每周固定活动（如周三例训 / 周五例跑 + 地点）。
+6. `GIFT_NAME` / `LOTTERY_PRIZE` —— 打卡礼物与抽奖奖品文案。
+7. `LLM_*` —— 换成自己的大模型端点或本地 Ollama（不配也能跑，纯模板文案）。
+
+更进一步（改代码）的常见定制点：
+
+- 里程碑 / 礼物天数 / 抽奖阈值 / 节日彩蛋：`app/services/checkin.py` 顶部常量。
+- 只统计跑动类（过滤游泳/骑行）：`app/services/providers/garmin.py` 的 `_RUNNING_TYPE_KEYS`、`coros.py` 的 `_RUNNING_SPORT_TYPES`。
+- 新平台接入：实现 `app/services/providers/base.py` 的 `SportProvider` 接口并注册。
 
 ## 数据与隐私
 
@@ -237,6 +268,8 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 - 成员账号凭据按 QQ 号隔离存于 `data/accounts/`，且只在私聊中收集，绝不出现在群里；落盘前经 Fernet 加密。
 - **⚠️ 密钥备份（重要）**：`data/secret.key` 是 Fernet 对称密钥，所有已加密凭据都依赖它解密。请把 `data/secret.key` 与 `data/` **一起备份**——一旦密钥文件丢失、损坏或被误删，所有已加密的账号凭据将**永久无法解密**（无法找回），成员会表现为「未绑定」，只能重新绑定各自的 Garmin / COROS 账号。
 - OCR 用本地 RapidOCR，默认图片不离开本机；仅当本地 OCR 读不出距离、且 `LLM_VISION_ENABLED=true` 时，才把截图发给视觉模型兜底识别。
+- 群成员提问进入 LLM 前先经本地清洗与**提示词注入拦截**（`app/services/guards.py`），模型身份由 prompt + 代码级「身份兜底」双重保护。
+- 下载图片按地址分级校验 TLS：公网 URL 严格校验证书，内网（NapCat 自签 / HTTP）自动降级，防止中间人替换图片。
 - `.env`、`data/` 已加入 `.gitignore`，不会随代码提交到仓库。**请勿将你的 `.env` 或 `data/` 上传到任何公开位置。**
 
 ## 部署到常开主机
@@ -250,8 +283,8 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 3. NapCat 用 Windows 版。
 4. 用 [NSSM](https://nssm.cc/) 把 `python bot.py` 注册为 Windows 服务开机自启：
    ```
-   nssm install JkcBot "C:\...\python.exe" "C:\...\bot.py"
-   nssm start JkcBot
+   nssm install SportsGroupBot "C:\...\python.exe" "C:\...\bot.py"
+   nssm start SportsGroupBot
    ```
 
 ### 方案 B：Linux
@@ -259,6 +292,14 @@ NapCat 负责登录 QQ 并通过反向 WebSocket 把消息推给机器人：
 1. 装 Python 3.10+，`pip install -e .`，配 `.env`。
 2. NapCat 用 Linux 版。
 3. 用 `screen` / `tmux` 或 `systemd` 常驻 `python bot.py`。
+
+## 运维与稳定性
+
+- **日志**：`data/bot.log` 自动轮转（1 MB × 7 份）；关键故障除日志外还登记**运维告警**，搭每日播报私聊管理员（同故障 6 小时内去重），数据悄悄缺失时第一时间可感知。
+- **成员账号级提醒**：平台授权被官方吊销等故障会**主动私聊成员本人**（24h 去重、失败自动重试），引导尽快重新绑定。
+- **调度自恢复**：每日播报 / 成员提醒两个常驻循环对未预期异常免疫（记告警 + 自动重试），不会静默停摆。
+- **启动自检**：数据库初始化失败快速报错；未配置 `SUPERUSERS` 时启动即告警；明文凭据迁移失败不阻断启动。
+- **备份建议**：定期备份 `data/`（数据库 + `secret.key` + 图片），`.env` 一并备份；升级前先停机器人再覆盖代码。
 
 ### Docker 化（规划中）
 

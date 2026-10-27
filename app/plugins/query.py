@@ -57,7 +57,7 @@ def _checkin_badge(qq: str) -> str:
         rank = ranking.today_distance_rank(qq, s)
     finally:
         s.close()
-    lines = [f"🎓 本学期第 {total} 次打卡"]
+    lines = [f"🎓 累计第 {total} 次打卡"]
     if streak:
         note = cheers.streak_note(streak)
         line = f"🔥 连续打卡 {streak} 天"
@@ -72,7 +72,7 @@ def _checkin_badge(qq: str) -> str:
 async def _milestone_cheers(qq: str, nickname: str, bot=None, gid=None) -> str:
     """若本次查询正好跨过打卡里程碑，返回祝贺彩蛋；否则空串。
 
-    同时在第 GIFT_DAYS 天自动领取礼物（先到先得）并通知团长。
+    同时在第 GIFT_DAYS 天自动领取礼物（先到先得）并通知管理员。
     幂等由 CheckinState 保证——截图路径已触发过的里程碑/礼物此处不再重复（返回空）。
     """
     s = get_session()
@@ -93,7 +93,7 @@ async def _milestone_cheers(qq: str, nickname: str, bot=None, gid=None) -> str:
     if gift_rank is not None:
         parts.append(
             f"🎁 恭喜 {nickname}！你是第 {gift_rank} 位达成第 {checkin.GIFT_DAYS} 天打卡的跑友，"
-            "自动领取「小红书惊喜小礼物」，已通知团长安排发货～"
+            f"自动领取「{checkin.GIFT_NAME}」，已通知管理员安排发货～"
         )
         if bot is not None:
             await notify_gift_claim(bot, qq, nickname, gift_rank, gid)

@@ -126,17 +126,18 @@ async def _send_private_robust(bot: Bot, user_id: int, group_id: int | None, mes
 
 
 async def notify_gift_claim(bot: Bot, qq: str, name: str, rank: int, gid: int | None) -> None:
-    """第 GIFT_DAYS 天礼物被自动领取时，通知团长（superuser）安排发货。"""
+    """第 GIFT_DAYS 天礼物被自动领取时，通知管理员（superuser）安排发货。"""
     for su in get_driver().config.superusers:
         try:
             await _send_private_robust(
                 bot,
                 int(su),
                 gid,
-                f"🎁 {name}（QQ {qq}）达成第 {checkin.GIFT_DAYS} 天打卡，自动领取小红书惊喜礼物（第 {rank} 位），请安排发货～",
+                f"🎁 {name}（QQ {qq}）达成第 {checkin.GIFT_DAYS} 天打卡，"
+                f"自动领取{checkin.GIFT_NAME}（第 {rank} 位），请安排发货～",
             )
         except Exception as e:
-            logger.warning(f"通知团长礼物领取失败: {e}")
+            logger.warning(f"通知管理员礼物领取失败: {e}")
 
 
 @bind_cmd.handle()

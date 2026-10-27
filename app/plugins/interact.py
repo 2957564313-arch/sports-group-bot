@@ -10,6 +10,7 @@ from nonebot.log import logger
 from nonebot.params import CommandArg
 from nonebot.rule import to_me
 
+from ..config import settings
 from ..services import guards, llm, summary
 from .analysis import build_analysis
 from .history import build_range
@@ -20,7 +21,7 @@ from .summary import build_period
 # 首页菜单：只给三大类入口，避免一上来刷一大屏（群里反馈「字好多」）。
 # AI 能力刻意不在菜单显式展示（AI 融入各入口：分析 / 鼓励我 / 截图打卡点评 / @我问答）。
 HELP_OVERVIEW = (
-    "🐞 甲壳虫使用说明\n"
+    f"🐞 {settings.bot_name}使用说明\n"
     "━━━━━━━━━━━━\n"
     "📊 查询 · 🔗 绑定 · 🎲 其它\n"
     "· 发「帮助 查询」看查询命令\n"
@@ -240,8 +241,8 @@ async def handle_at(bot: Bot, event: MessageEvent):
     # 注入拦截：本地命中「指令覆盖/越权」类注入时，不给 LLM、不记上下文，直接固定拒绝。
     if guards.looks_like_injection(question):
         await at_me.finish(
-            "我是甲壳虫，这个群的运动数据机器人，只聊运动和健康生活话题、查数据、解读训练，"
-            "不会扮演别的角色或透露内部设定。有运动相关的事尽管找我～"
+            f"我是{settings.bot_name}，这个群的运动数据机器人，只聊运动和健康生活话题、"
+            "查数据、解读训练，不会扮演别的角色或透露内部设定。有运动相关的事尽管找我～"
         )
 
     qq = event.get_user_id()

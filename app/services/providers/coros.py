@@ -38,8 +38,8 @@ class CorosProvider(SportProvider):
     }
     REDIRECT_URI = "http://127.0.0.1:43123/callback"
     SCOPE = "openid offline_access mcp.tools"
-    CLIENT_NAME = "jia-ke-chong-bot"
-    _UA = {"User-Agent": "jia-ke-chong-bot/0.1.0"}
+    CLIENT_NAME = "sports-group-bot"
+    _UA = {"User-Agent": "sports-group-bot/0.2.0"}
 
     _DIR = Path("data/accounts")
 

@@ -42,26 +42,29 @@ class DayEvent:
     location: str = ""
 
 
-# 固定活动：每周三「例训」、每周五「例跑」，默认都在西北田径场。
-# weekday() 返回值：0=周一 … 2=周三 4=周五。
-WEEKLY_EVENTS: dict[int, DayEvent] = {
-    2: DayEvent(name="例训", time="16:00", location="西北田径场"),
-    4: DayEvent(name="例跑", time="20:00", location="西北田径场"),
-}
+# 固定活动：来自 .env 的 WEEKLY_EVENTS（JSON 数组，weekday 0=周一 … 6=周日）。
+# 留空 = 无固定活动，月历只显示管理员手动添加的活动；各群可按自己的例行安排配置。
+def weekly_events() -> dict[int, DayEvent]:
+    """把 settings.weekly_events 转成 {weekday: DayEvent}（函数而非常量，测试可 monkeypatch）。"""
+    return {
+        e.weekday: DayEvent(name=e.name, time=e.time, location=e.location)
+        for e in settings.weekly_events
+    }
 
 
 def resolve_month_events(
     year: int, month: int, manual_acts: list[Activity], cancel_acts: list[Activity]
 ) -> dict[int, DayEvent]:
-    """合并某月活动：固定活动（每周三例训/周五例跑）打底，手动活动覆盖，取消则当天不显示。
+    """合并某月活动：固定活动（WEEKLY_EVENTS）打底，手动活动覆盖，取消则当天不显示。
 
     返回 {日: DayEvent}，每天最多一个活动（优先手动）。
     """
+    weekly = weekly_events()
     events: dict[int, DayEvent] = {}
     for day in range(1, monthrange(year, month)[1] + 1):
         wd = datetime.date(year, month, day).weekday()
-        if wd in WEEKLY_EVENTS:
-            events[day] = WEEKLY_EVENTS[wd]
+        if wd in weekly:
+            events[day] = weekly[wd]
     for a in cancel_acts:
         events.pop(a.date.day, None)
     for a in manual_acts:
@@ -189,7 +192,7 @@ def generate_calendar_image(
     """生成某月「跑团日历」PNG：周一开头、有活动的日期画红圈、格内标注活动名。
 
     manual_acts: 手动活动（kind=manual）；cancel_acts: 取消固定活动的标记（kind=cancel），可空。
-    固定活动（每周三例训/周五例跑）自动展开；同日手动活动覆盖固定活动。
+    固定活动（WEEKLY_EVENTS 配置）自动展开；同日手动活动覆盖固定活动。
     """
     from calendar import monthcalendar
 
@@ -219,10 +222,12 @@ def generate_calendar_image(
     name_font = _load_font(20 * S)
 
     # 主标题 + 副标题 + 月份行
-    draw.text((W / 2, 42 * S), "甲壳虫月历", font=main_font, anchor="mm", fill="black")
+    draw.text(
+        (W / 2, 42 * S), f"{settings.bot_name}月历", font=main_font, anchor="mm", fill="black"
+    )
     draw.text(
         (W / 2, 80 * S),
-        "runner calendar 一起跑，向未来",
+        "跑团日历 · 一起跑，向未来",
         font=sub_font,
         anchor="mm",
         fill="#888888",
@@ -295,7 +300,7 @@ def _calendar_key(year: int, month: int) -> str:
 
 
 async def remind_tomorrow(today: datetime.date) -> None:
-    """提醒「明天有活动」：只查明天的手动活动（固定例训/例跑不提醒），逐条发到目标群，成功后打幂等标记。"""
+    """提醒「明天有活动」：只查明天的手动活动（固定活动不提醒），逐条发到目标群，成功后打幂等标记。"""
     tomorrow = today + datetime.timedelta(days=1)
     session = get_session()
     try:

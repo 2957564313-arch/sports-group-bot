@@ -1,13 +1,29 @@
 from datetime import date, timedelta
 
-from sqlalchemy import delete
+from sqlalchemy import delete, text
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..db import get_session
+from ..db import engine, get_session
 from ..models.checkin_log import CheckinLog
 from ..models.daily_record import DailyRecord
 from . import timeutil
+
+
+def _wal_checkpoint() -> None:
+    """清理删除大量行后顺手 checkpoint，避免 SQLite WAL 文件长期膨胀（仅 SQLite 生效）。
+
+    每日清理过期明细会删掉一整天的记录，不做 checkpoint 的话 -wal 文件会把删除的
+    旧页一直带在身上，长期运行下占满磁盘；TRUNCATE 模式在 WAL 下安全（没有并发写者）。
+    失败静默：checkpoint 只是空间优化，不该影响清理主流程。
+    """
+    if not settings.db_url.startswith("sqlite"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+    except Exception:
+        pass
 
 
 def cleanup_daily(before: date | None = None) -> int:
@@ -28,6 +44,7 @@ def cleanup_daily(before: date | None = None) -> int:
         return result.rowcount or 0
     finally:
         session.close()
+        _wal_checkpoint()
 
 
 def cleanup_checkin_logs(before: date | None = None) -> int:
@@ -48,3 +65,4 @@ def cleanup_checkin_logs(before: date | None = None) -> int:
         return result.rowcount or 0
     finally:
         session.close()
+        _wal_checkpoint()

@@ -522,11 +522,11 @@ async def handle_image(bot: Bot, event: MessageEvent):
     for m in milestone_hits:
         cheer = await asyncio.to_thread(llm.milestone_cheer, name, m)
         reply += f"\n\n🎉 {cheer or f'达成第 {m} 次打卡里程碑，坚持就是胜利！'}"
-    # 第 GIFT_DAYS 天礼物：自动领取（先到先得），并通知团长
+    # 第 GIFT_DAYS 天礼物：自动领取（先到先得），并通知管理员
     if gift_rank is not None:
         reply += (
             f"\n\n🎁 恭喜 {name}！你是第 {gift_rank} 位达成第 {checkin.GIFT_DAYS} 天打卡的跑友，"
-            "自动领取「小红书惊喜小礼物」，已通知团长安排发货～"
+            f"自动领取「{checkin.GIFT_NAME}」，已通知管理员安排发货～"
         )
         await notify_gift_claim(bot, qq, name, gift_rank, getattr(event, "group_id", None))
     # 节日+特殊距离彩蛋

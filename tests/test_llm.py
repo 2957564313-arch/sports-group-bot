@@ -25,7 +25,8 @@ def test_guard_identity_blocks_leak():
     msg = "我是 ChatGPT 模型"
     out = llm._guard_identity(msg)
     assert out != msg
-    assert "甲壳虫" in out
+    # 兜底话术统一锚定机器人名（settings.bot_name），不硬编码任何品牌
+    assert llm.settings.bot_name in out
 
 
 def test_guard_identity_does_not_overblock():

@@ -71,7 +71,8 @@ async def _fetch_today_images(bot: Bot, group_id: int) -> list[tuple[str, dict]]
     seq = 0
     for _ in range(_MAX_PAGES):
         resp = await bot.call_api("get_group_msg_history", group_id=group_id, message_seq=seq)
-        batch = resp.get("messages") or []
+        # call_api 异常响应（协议端故障等）可能返回 None，视为空页终止翻页
+        batch = (resp or {}).get("messages") or []
         if not batch:
             break
         for m in batch:

@@ -1,5 +1,10 @@
+import json
+import logging
+
 from pydantic import BaseModel, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_log = logging.getLogger(__name__)
 
 
 class LlmEndpoint(BaseModel):
@@ -21,10 +26,23 @@ class LlmEndpoint(BaseModel):
     vision: bool = False
 
 
+class WeeklyEvent(BaseModel):
+    """WEEKLY_EVENTS 中的一个固定活动：每周星期几 + 名称/时间/地点。"""
+
+    weekday: int  # 0=周一 … 6=周日
+    name: str
+    time: str = ""
+    location: str = ""
+
+
 class Settings(BaseSettings):
     """从 .env 读取配置，字段名与 .env 中变量名大小写不敏感对应。"""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # 机器人在群里的称呼（帮助菜单 / LLM 人设 / 月历标题等处统一使用），
+    # 各群可自行改成自己的名字（如跑团名），代码里不再硬编码机器人名。
+    bot_name: str = "运动搭子"
 
     # 数据库连接
     db_url: str = "sqlite:///data/bot.db"
@@ -40,8 +58,18 @@ class Settings(BaseSettings):
     # 留空 = 不限制（全群可用）。需要限制时在 .env 用 ALLOWED_GROUPS 填写（JSON 数组）。
     allowed_groups: list[int] = []
 
-    # 打卡计数起点（本学期开学日，YYYY-MM-DD）：此日期之前的记录不统计打卡天数。
-    semester_start: str = "2026-09-20"
+    # 打卡计数起点（YYYY-MM-DD）：此日期之前的记录不统计打卡天数。
+    # 默认 1970-01-01 = 统计全部历史；按学期运行的群可改为开学日等自定义起点。
+    semester_start: str = "1970-01-01"
+
+    # 打卡体系文案（可配置，去掉硬编码的群专属内容）：
+    gift_name: str = "惊喜小礼物"  # 第 GIFT_DAYS 天礼物的名称
+    lottery_prize: str = "惊喜奖品"  # 群抽奖奖品名称
+
+    # 每周固定活动（JSON 数组）：自动进入跑团月历；weekday 0=周一 … 6=周日。
+    # 例：WEEKLY_EVENTS=[{"weekday":2,"name":"例训","time":"16:00","location":"田径场"}]
+    # 留空 = 无固定活动，月历只显示管理员手动添加的活动。
+    weekly_events: list[WeeklyEvent] = []
 
     # Garmin 佳明（每用户凭据绑定，此处仅区域开关；中国区账号 is_cn=true）
     garmin_is_cn: bool = True
@@ -84,6 +112,38 @@ class Settings(BaseSettings):
         """
         if v is None or (isinstance(v, str) and not v.strip()):
             return 45.0
+        return v
+
+    @field_validator(
+        "broadcast_groups", "allowed_groups", "llm_fallbacks", "weekly_events", mode="before"
+    )
+    @classmethod
+    def _lenient_json_list(cls, v, info):
+        """容错：.env 里 JSON 数组写错（漏逗号 / 尾逗号 / 手误）时退回空列表并告警。
+
+        这类配置写错会导致 Settings 在 import 阶段抛 ValidationError，机器人整个起不来；
+        而它们都只是「增强/限制」性质的可选项，留空完全可运行——宁可带告警降级，
+        也不能让一行手误的配置把服务打挂。
+        """
+        if v is None or v == "" or v == []:
+            return []
+        if isinstance(v, (list, tuple)):
+            return v
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as e:
+                _log.warning(
+                    f"配置 {info.field_name} 不是合法 JSON（{e}），已退回默认值；请检查 .env"
+                )
+                return []
+            # JSON 合法但形状不对（如对象而非数组）同样视为配置错误，降级默认值
+            if not isinstance(parsed, list):
+                _log.warning(
+                    f"配置 {info.field_name} 应为 JSON 数组（当前是对象），已退回默认值；请检查 .env"
+                )
+                return []
+            return parsed
         return v
 
 

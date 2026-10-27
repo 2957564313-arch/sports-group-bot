@@ -1,6 +1,6 @@
-# 甲壳虫 —— 架构设计与路线图
+# sports-group-bot —— 架构设计与路线图
 
-本文档描述「甲壳虫」QQ 群运动机器人的整体设计、分层结构、核心取舍与后续计划。面向后续维护者与协作者。
+本文档描述本 QQ 群运动数据机器人的整体设计、分层结构、核心取舍与后续计划。面向后续维护者与协作者。
 
 ## 1. 项目定位
 
@@ -12,6 +12,8 @@
 - 未接入平台的成员：发一张运动截图即可自动记录、进入排行；
 - 全部交互用一句命令 / 一张图完成，不用跳转 App。
 
+所有群专属内容（机器人名 / 群名单 / 打卡起点 / 固定活动 / 礼物文案）均由 `.env` 配置，代码可直接 fork 嫁接。
+
 ## 2. 技术选型
 
 | 环节 | 选型 | 理由 |
@@ -21,9 +23,9 @@
 | 数据存储 | SQLAlchemy 2.0 + SQLite | 单文件、零运维、够用；`Session` 按需创建 |
 | OCR | RapidOCR（rapidocr-onnxruntime） | **本地**识别，截图数据不出本机 |
 | 平台 SDK | garminconnect / COROS 官方 MCP | 佳明仅邮箱登录；COROS 走 OAuth 授权码 + PKCE |
-| 大模型 | 智谱 GLM-5.3-Flash（OpenAI 兼容） | 默认端点；原生多模态（文本 + 图片）、1M 上下文、约 0.8/2.8 元每百万 token；支持 LLM_FALLBACKS 模型池故障转移（可兜底本地 Ollama） |
-| 配置 | pydantic-settings | 类型安全读 `.env` |
-| 代码质量 | ruff（format + lint） | 单工具覆盖格式化 / 静态检查 / 导入排序 |
+| 大模型 | 智谱 GLM-5.3-Flash（OpenAI 兼容） | 默认端点；原生多模态（文本 + 图片）、1M 上下文；支持 LLM_FALLBACKS 模型池故障转移（可兜底本地 Ollama） |
+| 配置 | pydantic-settings | 类型安全读 `.env`，JSON 数组配置写错自动降级默认值 |
+| 代码质量 | ruff（format + lint）+ pytest | 单工具覆盖格式化 / 静态检查 / 导入排序；测试全离线、不触网 |
 
 ## 3. 架构分层
 
@@ -32,17 +34,17 @@
 │ 协议层   NoneBot2 + OneBot v11 适配器（NapCat 反向 WS）│
 ├─────────────────────────────────────────────────────┤
 │ 插件层   app/plugins（14 个：命令处理器 + 消息处理器） │
-│          admin / activity / checkin / diagnose /     │
-│          gate / group_tracker / history / image_ocr/ │
+│          admin / activity / checkin / history /      │
+│          gate / group_tracker / image_ocr /          │
 │          interact / lottery / profile / query /      │
 │          ranking / summary                           │
 ├─────────────────────────────────────────────────────┤
 │ 服务层   app/services（业务逻辑，与 NoneBot 解耦）     │
 │          activity · checkin · cheers · credentials · │
-│          crypto · diagnose · llm · member · ocr ·    │
-│          parsers · permission · ranking · retention ·│
-│          summary · sync · tasks · timeutil ·         │
-│          providers/                                  │
+│          crypto · diagnose · guards · llm · member · │
+│          net · notify · ocr · parsers · permission · │
+│          ranking · retention · summary · sync ·      │
+│          tasks · timeutil · providers/               │
 ├─────────────────────────────────────────────────────┤
 │ 数据层   app/models（SQLAlchemy ORM）+ SQLite         │
 └─────────────────────────────────────────────────────┘
@@ -64,8 +66,8 @@ LLM 被严格限制在**核心数据链路之外**：
 ### 4.2 隐私最小化
 
 - 发给 LLM 的**只有聚合后的数字**，绝不发送原始消息、截图、账号密码。
-- 成员账号凭据按 QQ 号隔离存于 `data/accounts/`，只在私聊中收集。
-- OCR 用本地模型，图片不离开本机。
+- 成员账号凭据按 QQ 号隔离存于 `data/accounts/`，只在私聊中收集，落盘前 Fernet 加密。
+- OCR 用本地模型，图片默认不离开本机（视觉兜底受 `LLM_VISION_ENABLED` 开关控制）。
 
 ### 4.3 每用户独立绑定
 
@@ -77,9 +79,19 @@ LLM 被严格限制在**核心数据链路之外**：
 
 - **跨线程 Session**：SQLAlchemy 的 `Session` 非线程安全，`asyncio.to_thread` 里不共享同一 Session；SQLite 写入极快，直接在当前协程同步执行。
 - **截图去重**：NapCat 偶发发送超时会诱导用户重发同一张图，用「图片 MD5（字节级）+ dHash（感知级，抗转发二次压缩）」做 24 小时窗口、**全局跨成员**去重，避免重复累计里程；去重**只对未绑定平台成员生效**（绑定成员截图本就不写库），且前置到 OCR/视觉之前，命中即跳过、不再重复识别与上传。
+- **同日数据指纹判重**：同一场运动换张截图（详情页 / 分享卡片 / 不同 App）按「距离 ±1% + 辅助字段」判重不重复落库；两侧都识别出开始时间且差 >20 分钟判为两场。宁可误判重（用户可见、可修）也不误合并（两场漏记、用户无感知）。
 - **视觉按需兜底**：本地 OCR 是主路径，仅当「读不出距离」或「识别结果可疑（距离/时长速度超限、每公里消耗离谱）」时才把**该张**截图发给视觉模型复核一次，兼顾「截图不出本机」与识别准确性。
 - **解析兜底**：OCR 与解析各包 try/except，识别不出数据时静默跳过，不拖垮整条 handler。
 - **发送超时误报**：`finish()` 抛出的 `ActionFailed` / `FinishedException` 单独 re-raise，不误报为「业务失败」。
+- **调度自恢复**：每日播报 / 成员提醒两个常驻循环对未预期异常免疫（记运维告警 + 自动重试），定时任务不会静默死亡。
+- **配置容错**：`.env` 的 JSON 数组配置写错自动降级默认值并告警，机器人照常启动。
+- **运维可感知**：平台接口异常 / 同步失败等关键故障除日志外登记 `alert`，搭每日播报私聊管理员；账号级故障（如授权被官方吊销）经 `notify` 主动私聊成员本人。
+
+### 4.5 输入安全
+
+- 群成员提问进入 LLM 前经 `guards.clean_question`（剔控制/零宽字符、超长截断）+ `guards.looks_like_injection`（指令覆盖/越权类注入拦截）。
+- 模型身份由「prompt 人设 + `_guard_identity` 代码级兜底」双重保护，任何注入路径都无法让机器人报出底层模型名。
+- 下载图片按地址分级校验 TLS：公网 URL 严格校验证书，内网（NapCat 自签 / HTTP）自动降级。
 
 ## 5. 数据模型
 
@@ -94,7 +106,7 @@ LLM 被严格限制在**核心数据链路之外**：
 | `CheckinState` | `key`（PK） | 触发幂等标记（里程碑 / 礼物 / 抽奖 / 节日 / 活动） |
 | `Activity` | 自增 id | 跑团活动（manual 手动 / cancel 取消固定） |
 
-- 原始明细 `daily_record` 按 `settings.retention_days` 滚动保留（默认 **365 天**），供个人复盘 / 历史查询。
+- 原始明细 `daily_record` 按 `settings.retention_days` 滚动保留（默认 **365 天**），供个人复盘 / 历史查询；清理后顺手做 WAL checkpoint，避免 SQLite -wal 文件膨胀。
 - 周榜 / 月榜**直接由明细聚合**（`compute_range_rankings`）。
 
 ## 6. 关键数据流
@@ -121,7 +133,7 @@ LLM 被严格限制在**核心数据链路之外**：
 MD5 + dHash 去重（命中即跳过：不 OCR、不上传、不落盘）→ 保存原始图 →
 本地 RapidOCR 识别 → parse_activity_from_boxes（坐标关联）→ parse_activity（文本兜底）→
 【按需】视觉兜底（仅当 OCR 读不出距离 / 识别结果可疑时，才上传该张截图做一次复核）→
-sanitize_activity（范围 + 速度 + 卡路里交叉校验）→
+sanitize_activity（范围 + 速度 + 卡路里交叉校验）→ 同日数据指纹判重 →
 写入 daily_record + ManualDistance → LLM 打卡点评（失败降级）
   ↓ 已绑定平台
 截图只回显：不写库、不触发视觉（数据以平台接口自动同步为准）
@@ -136,11 +148,12 @@ compute_range_rankings(start, end) → 按距离 / 爬升聚合（月榜追加�
 
 ### 6.5 调度
 
-单个常驻 asyncio 循环（`services/tasks.py` 的 `start_scheduler`）：
+两个常驻 asyncio 循环（`services/tasks.py` 的 `start_scheduler`，均异常自恢复）：
 
 - `_daily_broadcast_loop`：每天 23:00（`BROADCAST_HOUR/MINUTE`）执行 `_run_broadcast`，
   依次做：清理过期明细 → 同步今日数据 → 计算并播报排行 → 群抽奖兜底 →
   活动前一天提醒 → 月末发下月跑团日历。
+- `_member_notify_loop`：每 30 秒抽取 `notify` 队列，把账号级提醒私聊成员（24h 去重、失败重试限次）。
 
 ## 7. 安全与隐私约束
 
@@ -151,33 +164,36 @@ compute_range_rankings(start, end) → 按距离 / 爬升聚合（月榜追加�
 - 成员账号密码绝不出现在群里：Garmin 必须私聊绑定，COROS 必须私聊授权链接。
 - 不打印 / 暴露 `passkey.json` 与 NapCat WebUI token。
 - `.env`、`data/`、缓存目录已加入 `.gitignore`，不入库。
+- 代码中不得硬编码任何群专属内容（机器人名 / 群号 / 活动 / 文案），一律走 `.env` 配置。
 
 ## 8. 当前状态（已完成）
 
-- ✅ Garmin / COROS 双平台接入，每用户独立绑定（华为 / Suunto 已彻底移除）。
-- ✅ 截图 OCR 打卡（含去重、尺寸过滤、坐标解析、文本兜底）。
+- ✅ Garmin / COROS 双平台接入，每用户独立绑定（无开放接口的平台统一走截图 OCR）。
+- ✅ 截图 OCR 打卡（含双重去重、尺寸过滤、坐标解析、文本兜底、可疑复核）。
 - ✅ 今日 / 周数据 / 月数据 / 近30天 / 详细数据（逐日明细）/ 分析（总结+建议+诊断三合一）/ 鼓励我 查询。
 - ✅ 训练诊断（并入「分析」）：ACWR 负荷 / CTL·ATL·TSB 负荷状态（TRIMP 或跑量 EWMA，双基线按 HR 数据覆盖率自动切换）/ 强度分布（极化训练 80/20 检验，Seiler）/ Karvonen 心率区间 Z1~Z5（Tanaka 估算最大心率，需设年龄）/ 恢复信号 / 配速趋势 + 附比赛成绩算 VO₂max / 成绩预测（运动科学确定性公式，非 LLM）；裸「分析」不含成绩预测，结尾引导补 5k 最佳成绩解锁。
 - ✅ 日榜 / 周榜 / 月榜 + 定时播报（周日 / 月末自动追加）。
-- ✅ 活动播报（跑团日历）：固定周三例训 / 周五例跑自动进日历 + 手动活动覆盖 / 取消 + 每月末发下月日历图 + 活动前一天 23:00 提醒（管理员隐藏命令）。
-- ✅ 大模型增强层（默认 GLM-5.3-Flash：分析 / 鼓励 / 问答（结合本人数据上下文）/ 打卡点评，失败降级模板；LLM_FALLBACKS 端点池故障转移）。
+- ✅ 活动播报（跑团日历）：固定活动（`WEEKLY_EVENTS` 配置）自动进日历 + 手动活动覆盖 / 取消 + 每月末发下月日历图 + 活动前一天 23:00 提醒（管理员隐藏命令）。
+- ✅ 大模型增强层（默认 GLM-5.3-Flash：分析 / 鼓励 / 问答（结合本人数据上下文）/ 打卡点评，失败降级模板；LLM_FALLBACKS 端点池故障转移；身份防泄露双重保险）。
 - ✅ 抽奖 / 骰子 / 随机数 互动玩法。
-- ✅ 代码规范化：ruff 格式化 + 静态检查全过，`pyproject.toml` 依赖补全。
+- ✅ 运维体系：alert 运维告警私聊管理员 + notify 成员账号级提醒 + 调度循环自恢复 + WAL 压缩。
+- ✅ 开源化：机器人名 / 固定活动 / 礼物文案 / 打卡起点全部配置化，代码零群专属硬编码。
+- ✅ 代码规范化：ruff 格式化 + 静态检查全过，测试全离线（192 项）。
 
 ## 9. 路线图（规划中）
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
 | 高 | Docker 化 | 补 `Dockerfile` + `docker-compose.yml`，降低部署门槛 |
-| 高 | 单元测试 | `parsers` / `ranking` / `retention` / `summary` 等纯函数先覆盖 |
-| 中 | CI 流水线 | GitHub Actions：`ruff check` + `compileall` + 测试 |
+| 高 | CI 流水线 | GitHub Actions：`ruff check` + `compileall` + 测试 |
 | 中 | 训练负荷进阶 | 基于 `training_load` 做趋势 / 恢复建议（注意不编造医学结论） |
 | 低 | 更多平台 | 有官方开放接口时再评估（如 Keep、悦跑圈等） |
-| 低 | LICENSE 选择 | 开源前确定许可协议 |
 
 ## 10. 历史决策记录
 
-- **华为 / Suunto 移除**：无稳定开放接口、维护成本高，改为「截图 OCR」统一兜底。
+- **无开放接口平台统一「截图 OCR」兜底**：华为 / Suunto 等无稳定开放接口、维护成本高，不再单独接入。
 - **截图成员也进排行**：未绑定成员的发图记录写入 `daily_record`（`platform="manual"`），与平台成员同榜竞技。
-- **`weekly_stat` 保留但不再用于排行**：改为「明细保留 365 天 + 直接聚合」，避免周清理误删月榜数据；`aggregate_week` 幂等写入保留，无害。
+- **周榜 / 月榜直接聚合明细**：改为「明细保留 365 天 + 直接聚合」，避免周清理误删月榜数据。
 - **OCR 保持默认模型**：PP-OCRv5 中文精确匹配率反而低于默认的 PP-OCRv4 mobile，不做无收益替换；优化重心放在「按坐标关联标签与数值」。
+- **训练处方功能整体移除**：实测「AI 给具体训练安排」不合理，只保留诊断指标（单调性 / EWMA 负荷比）。
+- **机器人身份配置化**：群专属名 / 固定活动 / 礼物文案从硬编码改为 `.env` 配置，仓库开源化。
