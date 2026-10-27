@@ -17,4 +17,4 @@ venv/
 .vscode/
 .DS_Store
 .claude/
-jkc-deploy.tar.gz
+*-deploy.tar.gz
