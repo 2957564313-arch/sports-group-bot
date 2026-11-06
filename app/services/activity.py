@@ -291,8 +291,16 @@ def generate_calendar_image(
 # ---------------------------------------------------------------------------
 
 
-def _remind_key(act_id: int) -> str:
-    return f"activity_remind:{act_id}"
+def _remind_key(act_id: int, group_id: int | None = None) -> str:
+    """活动提醒幂等 key。
+
+    晋级后按 (活动, 群) 粒度记录：某群禁言 / 机器人被踢 / 单群网络失败时，
+    只有那个群会重试，不会因为别的群发送成功就把整条提醒「标记为已发」而永久漏掉。
+    不带 group_id 的旧 key 仍被识别（历史数据视为「全部群已提醒」，避免升级后重复刷屏）。
+    """
+    if group_id is None:
+        return f"activity_remind:{act_id}"
+    return f"activity_remind:{act_id}:{group_id}"
 
 
 def _calendar_key(year: int, month: int) -> str:
@@ -300,7 +308,11 @@ def _calendar_key(year: int, month: int) -> str:
 
 
 async def remind_tomorrow(today: datetime.date) -> None:
-    """提醒「明天有活动」：只查明天的手动活动（固定活动不提醒），逐条发到目标群，成功后打幂等标记。"""
+    """提醒「明天有活动」：只查明天的手动活动（固定活动不提醒），按群幂等发送。
+
+    幂等粒度是 (活动, 群)：某个群发送失败（禁言/被踢/网络抖动）不会因为别的群
+    成功就被标记成「已提醒」，下一轮播报会继续补发那个群。
+    """
     tomorrow = today + datetime.timedelta(days=1)
     session = get_session()
     try:
@@ -313,25 +325,32 @@ async def remind_tomorrow(today: datetime.date) -> None:
             .scalars()
             .all()
         )
-        if not acts:
-            return
-        keys = [_remind_key(a.id) for a in acts]
+    finally:
+        session.close()
+    if not acts:
+        return
+
+    bots, groups = await resolve_targets()
+    if not bots or not groups:
+        logger.warning("明天有活动但无可播报的群或 bot，跳过提醒（下轮再试）")
+        return
+
+    # 旧版按「整条活动」记的 key 视为已提醒，避免升级后对历史活动重复刷屏
+    legacy = {_remind_key(a.id) for a in acts}
+    wanted = {_remind_key(a.id, gid) for a in acts for gid in groups}
+    session = get_session()
+    try:
         done = set(
-            session.execute(select(CheckinState.key).where(CheckinState.key.in_(keys)))
+            session.execute(select(CheckinState.key).where(CheckinState.key.in_(legacy | wanted)))
             .scalars()
             .all()
         )
     finally:
         session.close()
 
-    bots, groups = await resolve_targets()
-    if not bots or not groups:
-        logger.warning("明天有活动但无可播报的群或 bot，跳过提醒")
-        return
-
+    fresh: set[str] = set()
     for a in acts:
-        key = _remind_key(a.id)
-        if key in done:
+        if _remind_key(a.id) in done:
             continue
         text = (
             "📅 明天有活动！\n"
@@ -339,21 +358,27 @@ async def remind_tomorrow(today: datetime.date) -> None:
             f"🕐 时间：{a.time or '待定'}\n"
             f"📍 地点：{a.location or '待定'}"
         )
-        sent = False
-        for bot in bots:
-            for gid in groups:
+        for gid in groups:
+            key = _remind_key(a.id, gid)
+            if key in done:
+                continue
+            for bot in bots:
                 try:
                     await bot.send_group_msg(group_id=gid, message=text)
-                    sent = True
+                    fresh.add(key)
+                    break
                 except Exception as e:
                     logger.warning(f"向群 {gid} 提醒活动「{a.name}」失败: {e}")
-        if sent:
-            session = get_session()
-            try:
+    if not fresh:
+        return
+    session = get_session()
+    try:
+        for key in fresh:
+            if session.get(CheckinState, key) is None:
                 session.add(CheckinState(key=key))
-                session.commit()
-            finally:
-                session.close()
+        session.commit()
+    finally:
+        session.close()
 
 
 def _cleanup_old_calendars(keep: int = 3) -> None:

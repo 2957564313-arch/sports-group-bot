@@ -57,6 +57,10 @@ _PRIVATE_RETRY_DELAY = 1.0
 # 在完成时自动移除。
 _BG_TASKS: set[asyncio.Task] = set()
 
+# 「同步数据」后台回填是否在跑：连点会并发起多个全量回填（每人 31 天网络请求），
+# 且 sync_history 的 rollback 可能撤销同 session 的其它 pending 变更。
+_backfill_running = False
+
 
 def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
@@ -70,7 +74,16 @@ async def _backfill_async(qqs: list[str] | None = None) -> None:
     逐日调用 provider.fetch_daily 并 upsert 进 daily_record，供周榜/月榜聚合。
     阻塞的网络 + DB 调用放 asyncio.to_thread，避免卡住事件循环；sync_history 内部自开
     session，这里只把 (qq, platform) 普通值传进线程，不共享主线程 Session。
+    运行中标志由调用方（「同步数据」命令）置位，这里在结束时无条件复位。
     """
+    global _backfill_running
+    try:
+        await _do_backfill(qqs)
+    finally:
+        _backfill_running = False
+
+
+async def _do_backfill(qqs: list[str] | None = None) -> None:
     session = get_session()
     try:
         stmt = select(Member).where(Member.platform != "")
@@ -155,8 +168,10 @@ async def handle_bind(bot: Bot, event: MessageEvent, args: Message = CommandArg(
 
     # COROS：发私密授权链接（群临时会话优先，无需加好友，不暴露在群里），无需管理员
     if platform == "coros":
-        provider = get_provider("coros")
         try:
+            # get_provider 在未配置 COROS 凭据时会 raise RuntimeError，必须一起进 try，
+            # 否则异常冒出 matcher、用户收不到任何回复
+            provider = get_provider("coros")
             url = await asyncio.to_thread(provider.start_auth, {"qq": qq})
         except Exception as e:
             logger.exception(f"发起 COROS 授权失败: {e}")
@@ -263,8 +278,8 @@ async def handle_my_bind(bot: Bot, event: MessageEvent):
 @confirm_cmd.handle()
 async def handle_confirm(bot: Bot, event: MessageEvent):
     qq = event.get_user_id()
-    provider = get_provider("coros")
     try:
+        provider = get_provider("coros")
         result = await asyncio.to_thread(provider.finish_auth, qq)
     except RuntimeError as e:
         await confirm_cmd.finish(f"授权确认失败：{e}")
@@ -315,6 +330,8 @@ async def handle_unbind(bot: Bot, event: MessageEvent):
 
 @status_cmd.handle()
 async def handle_status(bot: Bot, event: MessageEvent):
+    if not is_superuser(event):
+        await status_cmd.finish("仅管理员可执行")
     session = get_session()
     try:
         counts = {
@@ -359,6 +376,10 @@ async def handle_sync_all(bot: Bot, event: MessageEvent):
         await sync_all_cmd.finish("还没有任何成员绑定平台")
 
     # 后台回填（逐日拉平台历史），避免长时间阻塞命令响应
+    global _backfill_running
+    if _backfill_running:
+        await sync_all_cmd.finish("同步任务正在后台进行，请稍后再试（完成后会记日志）")
+    _backfill_running = True
     _spawn(_backfill_async())
     await sync_all_cmd.finish(
         f"已开始后台同步 {len(members)} 人的历史数据（近 {BACKFILL_DAYS} 天），"
@@ -423,7 +444,7 @@ async def handle_checkin_logs(bot: Bot, event: MessageEvent, args: Message = Com
 
     qq = args.extract_plain_text().strip()
     if not qq:
-        await checkin_logs_cmd.finish("用法：打卡记录 QQ号\n例如：打卡记录 937826956")
+        await checkin_logs_cmd.finish("用法：打卡记录 QQ号\n例如：打卡记录 123456789")
 
     session = get_session()
     try:
@@ -464,7 +485,7 @@ async def handle_delete_checkin(bot: Bot, event: MessageEvent, args: Message = C
     parts = args.extract_plain_text().strip().split()
     if len(parts) != 2 or not parts[1].isdigit():
         await delete_checkin_cmd.finish(
-            "用法：删除打卡记录 QQ号 记录号\n例如：删除打卡记录 937826956 12"
+            "用法：删除打卡记录 QQ号 记录号\n例如：删除打卡记录 123456789 12"
         )
     qq, log_id = parts[0], int(parts[1])
 

@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from . import models  # noqa: F401  确保所有模型被导入并注册到 Base.metadata
@@ -71,8 +72,15 @@ def _migrate_columns() -> None:
         for name, ddl in cols.items():
             if name in existing:
                 continue
-            with engine.begin() as conn:
-                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {ddl}'))
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {ddl}'))
+            except OperationalError as e:
+                # 两个进程/线程同时 init_db 时，后到者会撞上 duplicate column：
+                # 说明列已被补上，忽略即可（幂等目标已达成）。
+                if "duplicate column" not in str(e).lower():
+                    raise
+                continue
             logger.info(f"迁移：表 {table} 新增列 {name}")
 
 

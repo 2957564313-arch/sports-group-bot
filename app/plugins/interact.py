@@ -188,7 +188,12 @@ async def _dispatch_query(event: GroupMessageEvent, question: str, bot=None) -> 
     # 预筛：明显不是查数据（如「膝盖疼怎么办」）直接跳过分类，避免白等一次 LLM
     if not _QUERY_HINTS.search(question):
         return None
-    intent = await asyncio.to_thread(llm.classify_intent, question)
+    try:
+        intent = await asyncio.to_thread(llm.classify_intent, question)
+    except Exception as e:
+        # LLM 异常不能让整个 at_me matcher 终止：降级为普通问答
+        logger.warning(f"意图分类失败（跳过数据路由）: {e}")
+        return None
     if not intent:
         return None
     kind = intent.get("intent")
@@ -266,7 +271,12 @@ async def handle_at(bot: Bot, event: MessageEvent):
                 context = llm.sport_facts_text(getattr(event.sender, "nickname", None) or qq, s)
         except Exception as e:
             logger.warning(f"构建成员数据上下文失败（不带上下文继续）: {e}")
-    text = await asyncio.to_thread(llm.answer_question, question, history, context)
+    try:
+        text = await asyncio.to_thread(llm.answer_question, question, history, context)
+    except Exception as e:
+        # 外层无 try 时异常会直接终止 matcher，@机器人的人一句回复都没有
+        logger.warning(f"运动问答失败（降级模板）: {e}")
+        text = ""
     if text:
         _remember(qq, gid, question, text)
         await at_me.finish(text)

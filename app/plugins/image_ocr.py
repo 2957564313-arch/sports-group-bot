@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import time
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 
@@ -189,6 +190,27 @@ def _mark_seen(md5: str, dhash: str = "") -> None:
         _RECENT_DHASH[dhash] = now
 
 
+def _forget(md5: str, dhash: str = "") -> None:
+    """释放占位：图片没能记入数据时（拒绝/未识别/出错），允许成员重发补记。"""
+    _RECENT_IMAGES.pop(md5, None)
+    if dhash:
+        _RECENT_DHASH.pop(dhash, None)
+
+
+def _save_image(img_bytes: bytes, qq: str) -> None:
+    """落库成功后才保存原图（便于排查 OCR 误差）。
+
+    不能提前保存：replay.py 的 ``_existing_md5s()`` 把 data/images 里所有 jpg 当成
+    「已记录」，提前落盘会让随后被跳过的图被补录判成重复，恰好拦掉本该救回的截图。
+    """
+    try:
+        IMG_DIR.mkdir(parents=True, exist_ok=True)
+        (IMG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{qq}.jpg").write_bytes(img_bytes)
+        _cleanup_images()
+    except Exception as e:
+        logger.warning(f"保存图片失败: {e}")
+
+
 @image_matcher.handle()
 async def handle_image(bot: Bot, event: MessageEvent):
     segs = [s for s in event.get_message() if s.type == "image"]
@@ -235,13 +257,11 @@ async def handle_image(bot: Bot, event: MessageEvent):
         logger.info(f"[图片识别] qq={qq} 检测到重复截图，跳过识别")
         await image_matcher.finish(f"⏳ {name}，这张截图刚才已经记过啦，本次不重复累计～")
 
-    # 保存原始图片，便于排查 OCR 识别误差
-    try:
-        IMG_DIR.mkdir(parents=True, exist_ok=True)
-        (IMG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{qq}.jpg").write_bytes(img_bytes)
-        _cleanup_images()
-    except Exception as e:
-        logger.warning(f"保存图片失败: {e}")
+    # 先占位再 OCR：中间有多个 await（本地 OCR / 视觉兜底 / 平台同步），若等 commit
+    # 成功才标记，同一张图被连发或两人同时转发时两个 handler 都会通过判重 → 距离与
+    # 打卡重复累计。失败路径（拒绝/未识别/出错）会 _forget 释放占位，不拦重发补记。
+    if not bound:
+        _mark_seen(img_md5, img_dhash)
 
     # 本地 OCR 识别（主路径，数据不出本机）。
     try:
@@ -362,6 +382,7 @@ async def handle_image(bot: Bot, event: MessageEvent):
     if reject_reason:
         # 数据不合理（多为非运动图误读）同样静默跳过：不回复任何消息，只记日志
         logger.info(f"[图片识别] qq={qq} 数据不合理，静默跳过: {reject_reason}")
+        _forget(img_md5, img_dhash)
         return
 
     if not any(
@@ -380,6 +401,7 @@ async def handle_image(bot: Bot, event: MessageEvent):
         # 不是运动数据截图（照片/表情之外的其它图、OCR 读不出任何运动字段）：
         # 一律静默跳过，不回复任何消息——避免对群内非运动图产生噪音。
         logger.info(f"[图片识别] qq={qq} 未识别出运动数据，静默跳过")
+        _forget(img_md5, img_dhash)
         return
 
     # 已绑定平台 → 只展示不写库（数据已由平台接口自动同步）；
@@ -394,6 +416,7 @@ async def handle_image(bot: Bot, event: MessageEvent):
             + "\n\n📌 你已绑定平台，本次截图未计入数据，今日与排行均以 App 同步为准"
         )
     if "distance_km" not in data:
+        _forget(img_md5, img_dhash)
         await image_matcher.finish(f"{name}，" + _format_cheer(data, period_str))
 
     # 「今日群内第 N 名」需全群当天数据齐全：先同步已绑定成员的今日数据（带节流，
@@ -421,11 +444,13 @@ async def handle_image(bot: Bot, event: MessageEvent):
         # 同日数据指纹判重（仅未绑定成员）：同一场运动换了张截图（详情页 / 分享卡片 /
         # 不同 App 同一次），数值几乎一致 → 不重复落库；同一天两场真实运动数值不同
         # （或开始时间相差 >20 分钟）→ 各自记录。写在任何落库动作之前。
+        # 窗口取「今天 + 昨天」：昨晚跑完今早补发同一张截图，是群里最常见的重复来源。
         if "distance_km" in data:
             logs = (
                 session.execute(
                     select(CheckinLog).where(
-                        CheckinLog.member_qq == qq, CheckinLog.record_date == today_d
+                        CheckinLog.member_qq == qq,
+                        CheckinLog.record_date >= today_d - timedelta(days=1),
                     )
                 )
                 .scalars()
@@ -485,10 +510,11 @@ async def handle_image(bot: Bot, event: MessageEvent):
             # 连续打卡 + 今日名次：落库后同 session 读，保证含本次刚写入的记录
             streak = checkin.current_streak(qq, session)
             today_rank = ranking.today_distance_rank(qq, session)
-            # 全部落库成功后才标记去重：commit 失败不会漏标，重发仍能补记
-            _mark_seen(img_md5, img_dhash)
+            # 全部落库成功后才保存原图：让 replay 的「已记录」判定只看到真正记过的图
+            _save_image(img_bytes, qq)
     except Exception as e:
         logger.exception(f"[图片识别] qq={qq} 记录失败: {e}")
+        _forget(img_md5, img_dhash)
         await image_matcher.finish(
             "😅 记到一半出错了，稍后再发一次这张图试试；还不行就发「帮助」找我聊聊～"
         )
@@ -496,9 +522,10 @@ async def handle_image(bot: Bot, event: MessageEvent):
         session.close()
 
     if dup_reply is not None:
-        # 数据指纹判重：同一场运动换了张截图，不落库，只说明原因（不 _mark_seen——
-        # 成员删除打卡后可以用这张图重新补记，标记了反而会拦掉）。
+        # 数据指纹判重：同一场运动换了张截图，不落库，只说明原因（释放占位——
+        # 成员删除打卡后可以用这张图重新补记，占着反而会拦掉）。
         logger.info(f"[图片识别] qq={qq} 同日数据指纹判重，跳过记录")
+        _forget(img_md5, img_dhash)
         await image_matcher.finish(dup_reply)
 
     reply = (

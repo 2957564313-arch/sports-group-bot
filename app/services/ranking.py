@@ -87,14 +87,11 @@ def compute_range_rankings(
                     distance[qq] = round(md.week_distance_km, 2)
 
         def _rank(agg: dict) -> list[tuple[str, float]]:
-            return [
-                (nicknames[qq], round(v, 2))
-                for qq, v in sorted(
-                    ((q, val) for q, val in agg.items() if val > 0),
-                    key=lambda kv: kv[1],
-                    reverse=True,
-                )[:top_n]
-            ]
+            # 先四舍五入再排序：榜单展示的是两位小数，同一展示值应并列，
+            # 再按昵称做次级排序，保证同值成员每次顺序稳定。
+            pairs = [(nicknames[qq], round(v, 2)) for qq, v in agg.items() if v > 0]
+            pairs.sort(key=lambda nv: (-nv[1], nv[0]))
+            return pairs[:top_n]
 
         return {
             "distance": _rank(distance),
@@ -128,9 +125,23 @@ def _fmt_rank(items: list[tuple[str, float]], unit: str, fmt: str) -> str:
     if not items:
         return "（暂无数据）"
     lines = []
+    rank = 0
+    prev: float | None = None
     for i, (name, val) in enumerate(items):
-        medal = _MEDALS[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{medal} {name}  {fmt.format(val)} {unit}")
+        # 同值并列同一名次（与 today_distance_rank 的「比我有多少人」口径一致），
+        # 否则两个同为 12.30 km 的人会被分到不同奖牌。
+        if prev is None or abs(val - prev) > 1e-9:
+            rank = i + 1
+            prev = val
+        medal = _MEDALS[rank - 1] if rank <= 3 else f"{rank}."
+        text = fmt.format(val)
+        # 0.004 km 这类正数按两位小数会显示 0.00，看起来像没运动
+        try:
+            if val > 0 and float(text) == 0:
+                text = "<0.01"
+        except ValueError:
+            pass
+        lines.append(f"{medal} {name}  {text} {unit}")
     return "\n".join(lines)
 
 

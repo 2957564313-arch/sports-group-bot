@@ -1,10 +1,97 @@
 import json
 import logging
+import re
 
 from pydantic import BaseModel, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _log = logging.getLogger(__name__)
+
+
+def _parse_json_list(value, field: str):
+    """把 .env 里的 JSON 数组字符串解析成 list；非法时告警并返回空列表。
+
+    这类配置写错会让 Settings 在 import 阶段抛 ValidationError、机器人整个起不来，
+    而它们都只是「增强 / 限制」性质的可选项，留空完全可运行——宁可带告警降级。
+    """
+    if value is None or value == "" or value == []:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as e:
+            _log.warning(f"配置 {field} 不是合法 JSON（{e}），已退回默认值；请检查 .env")
+            return []
+        if not isinstance(parsed, list):
+            _log.warning(
+                f"配置 {field} 应为 JSON 数组（当前是 {type(parsed).__name__}），"
+                "已退回默认值；请检查 .env"
+            )
+            return []
+        return parsed
+    return value
+
+
+def _clean_group_ids(raw, field: str) -> list[int]:
+    """群号列表逐项校验：非整数 / 布尔 / 非正数一律丢弃并告警。
+
+    只做「整个数组是否合法」的 JSON 校验不够——`[1, 2, "oops"]` 会让 pydantic 在
+    元素级抛 ValidationError，照样把机器人拦在启动阶段。
+    """
+    out: list[int] = []
+    for item in raw:
+        if isinstance(item, bool):
+            _log.warning(f"配置 {field} 含非法群号 {item!r}（布尔），已忽略；请检查 .env")
+            continue
+        try:
+            gid = int(item)
+        except (TypeError, ValueError):
+            _log.warning(f"配置 {field} 含非法群号 {item!r}，已忽略；请检查 .env")
+            continue
+        if gid <= 0:
+            _log.warning(f"配置 {field} 含非法群号 {gid}（必须为正整数），已忽略")
+            continue
+        if gid not in out:
+            out.append(gid)
+    return out
+
+
+def _clean_weekly_events(raw, field: str) -> list[dict]:
+    """固定活动逐项校验：weekday 必须在 0..6、name 必须非空，坏项丢弃并告警。"""
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            _log.warning(f"配置 {field} 含非对象元素 {item!r}，已忽略；请检查 .env")
+            continue
+        name = str(item.get("name") or "").strip()
+        try:
+            weekday = int(item.get("weekday"))
+        except (TypeError, ValueError):
+            _log.warning(f"配置 {field} 含非法 weekday {item.get('weekday')!r}，已忽略")
+            continue
+        if not name or not 0 <= weekday <= 6:
+            _log.warning(f"配置 {field} 元素不完整或 weekday 越界（{item!r}），已忽略")
+            continue
+        out.append({**item, "weekday": weekday, "name": name})
+    return out
+
+
+def _clean_llm_fallbacks(raw, field: str) -> list[dict]:
+    """备用端点逐项校验：model 与 http(s) base_url 缺一不可，坏项丢弃并告警。"""
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            _log.warning(f"配置 {field} 含非对象元素 {item!r}，已忽略；请检查 .env")
+            continue
+        model = str(item.get("model") or "").strip()
+        base_url = str(item.get("base_url") or "").strip()
+        if not model or not base_url.startswith(("http://", "https://")):
+            _log.warning(f"配置 {field} 元素缺少 model/base_url（{item!r}），已忽略")
+            continue
+        out.append({**item, "model": model, "base_url": base_url})
+    return out
 
 
 class LlmEndpoint(BaseModel):
@@ -71,6 +158,10 @@ class Settings(BaseSettings):
     # 留空 = 无固定活动，月历只显示管理员手动添加的活动。
     weekly_events: list[WeeklyEvent] = []
 
+    # 活动体系起始年月（YYYY-MM）：早于该月的「月历」请求直接提示无数据，
+    # 不再把 2026-10 这类群专属时间硬编码在插件里。
+    activity_start_month: str = "2026-10"
+
     # Garmin 佳明（每用户凭据绑定，此处仅区域开关；中国区账号 is_cn=true）
     garmin_is_cn: bool = True
 
@@ -119,32 +210,58 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _lenient_json_list(cls, v, info):
-        """容错：.env 里 JSON 数组写错（漏逗号 / 尾逗号 / 手误）时退回空列表并告警。
+        """容错：JSON 数组整体或单个元素写错时，丢弃坏项并告警，不让启动崩溃。
 
-        这类配置写错会导致 Settings 在 import 阶段抛 ValidationError，机器人整个起不来；
-        而它们都只是「增强/限制」性质的可选项，留空完全可运行——宁可带告警降级，
-        也不能让一行手误的配置把服务打挂。
+        只校验「整体是不是数组」不够：`[1, 2, "oops"]`、`[{"model": "x"}]` 这类
+        元素级错误同样会在 import 阶段抛 ValidationError，把机器人拦在启动之外。
         """
-        if v is None or v == "" or v == []:
-            return []
-        if isinstance(v, (list, tuple)):
-            return v
-        if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except json.JSONDecodeError as e:
-                _log.warning(
-                    f"配置 {info.field_name} 不是合法 JSON（{e}），已退回默认值；请检查 .env"
-                )
-                return []
-            # JSON 合法但形状不对（如对象而非数组）同样视为配置错误，降级默认值
-            if not isinstance(parsed, list):
-                _log.warning(
-                    f"配置 {info.field_name} 应为 JSON 数组（当前是对象），已退回默认值；请检查 .env"
-                )
-                return []
-            return parsed
-        return v
+        raw = _parse_json_list(v, info.field_name)
+        if not isinstance(raw, list):
+            return raw  # 交给 pydantic 报出更明确的类型错误
+        if info.field_name in {"broadcast_groups", "allowed_groups"}:
+            return _clean_group_ids(raw, info.field_name)
+        if info.field_name == "weekly_events":
+            return _clean_weekly_events(raw, info.field_name)
+        return _clean_llm_fallbacks(raw, info.field_name)
+
+    @field_validator("activity_start_month", mode="before")
+    @classmethod
+    def _clean_activity_month(cls, v):
+        """容错：ACTIVITY_START_MONTH 写成 2026-10 / 2026.10 / 2026年10月 均可。
+
+        解析失败退回 2026-10 并告警，避免一个手滑的 .env 值让机器人启动即崩。
+        """
+        m = re.fullmatch(r"(\d{4})\s*[-./年]\s*(\d{1,2})\s*月?", str(v or "").strip())
+        if not m:
+            if v not in (None, ""):
+                _log.warning(f"配置 activity_start_month={v!r} 无法解析，已退回 2026-10")
+            return "2026-10"
+        y, mo = int(m.group(1)), int(m.group(2))
+        if not 1 <= mo <= 12:
+            _log.warning(f"配置 activity_start_month={v!r} 月份越界，已退回 2026-10")
+            return "2026-10"
+        return f"{y:04d}-{mo:02d}"
+
+    @field_validator("broadcast_hour", "broadcast_minute", mode="before")
+    @classmethod
+    def _clamp_broadcast_time(cls, v, info):
+        """播报时刻越界（如 25 点、-1 分）时夹到合法区间并告警，避免启动即崩。"""
+        limit = 23 if info.field_name == "broadcast_hour" else 59
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            default = 23 if info.field_name == "broadcast_hour" else 0
+            _log.warning(
+                f"配置 {info.field_name} 不是整数（{v!r}），已退回默认值 {default}；请检查 .env"
+            )
+            return default
+        if n < 0 or n > limit:
+            clamped = min(max(n, 0), limit)
+            _log.warning(
+                f"配置 {info.field_name}={n} 越界（0~{limit}），已夹到 {clamped}；请检查 .env"
+            )
+            return clamped
+        return n
 
 
 settings = Settings()

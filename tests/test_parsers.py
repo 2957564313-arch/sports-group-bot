@@ -64,12 +64,11 @@ def test_sanitize_drop_impossible_speed_duration():
     assert cleaned["distance_km"] == 5.2
 
 
-def test_sanitize_keeps_long_run_drops_duration():
-    # 100 km 百公里越野 + 30 分钟（200 km/h 不可能）→ 保留距离（合法越野）、丢弃误读的时长
+def test_sanitize_reject_implausible_long_run():
+    # 100 km 百公里越野 + 30 分钟（200 km/h）无法判断是距离放大还是时长误读：
+    # 保留距离会污染排行与累计里程，整体拒收让用户补图，比静默记错安全。
     cleaned, reject = sanitize_activity({"distance_km": 100.0, "active_minutes": 30})
-    assert reject is None
-    assert "active_minutes" not in cleaned
-    assert cleaned["distance_km"] == 100.0
+    assert reject is not None
 
 
 def test_sanitize_drop_tiny_distance():

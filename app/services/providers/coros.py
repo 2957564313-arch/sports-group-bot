@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import secrets
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -40,6 +41,9 @@ class CorosProvider(SportProvider):
     SCOPE = "openid offline_access mcp.tools"
     CLIENT_NAME = "sports-group-bot"
     _UA = {"User-Agent": "sports-group-bot/0.2.0"}
+
+    # 同一成员并发同步时保护 token 刷新（进程内；跨进程仍靠双检 + 竞态兜底）
+    _token_lock = threading.Lock()
 
     _DIR = Path("data/accounts")
 
@@ -83,12 +87,16 @@ class CorosProvider(SportProvider):
             }
         )
 
-        cli = httpx.post(
+        cli_resp = httpx.post(
             f"{self._issuer}/api/v1/cli/login-sessions",
             json={"clientId": client_id},
             headers={**self._UA, "Content-Type": "application/json"},
             timeout=30,
-        ).json()
+        )
+        cli_resp.raise_for_status()
+        cli = cli_resp.json()
+        if not cli.get("sessionId") or not cli.get("pollToken") or not cli.get("loginUrl"):
+            raise RuntimeError(f"COROS 登录会话创建失败：{cli_resp.text[:200]}")
 
         qq = (extra or {}).get("qq", "unknown")
         pending = {
@@ -231,18 +239,40 @@ class CorosProvider(SportProvider):
         if not token or not token.get("access_token"):
             raise RuntimeError("COROS 尚未授权，请发送「绑定 coros」完成授权")
         if time.time() > token.get("expires_at_epoch", 0) - 300:
-            try:
-                token = self._refresh(qq, token)
-            except TokenRevokedError:
-                # 授权已被官方吊销（refresh 无效）：本地 token 已无意义，删掉避免
-                # 后续每次同步都白打一次 refresh；主动私聊提醒成员重新绑定，并登记
-                # 运维告警让管理员知晓。
-                self._token_path(qq).unlink(missing_ok=True)
-                notify.enqueue(qq, self._REBIND_NOTICE)
-                alert.record(
-                    "coros:revoked", f"COROS 授权被官方吊销（已私聊提醒成员 {qq} 重新绑定）"
-                )
-                raise RuntimeError("COROS 授权已失效，请重新发送「绑定 coros」授权") from None
+            # 同一成员被并发同步（截图 + 定时任务 + 回填）时会同时走到刷新：
+            # 后到者拿旧 refresh_token 换 token 会被服务端判 invalid_grant，
+            # 进而误删刚写入的有效 token。加锁 + 双检避免。
+            with self._token_lock:
+                fresh = self._load_json(self._token_path(qq))
+                if (
+                    fresh
+                    and fresh.get("access_token")
+                    and time.time() <= fresh.get("expires_at_epoch", 0) - 300
+                ):
+                    return fresh["access_token"]
+                base = fresh or token
+                try:
+                    token = self._refresh(qq, base)
+                except TokenRevokedError:
+                    # 竞态兜底：磁盘上已出现别的线程写回的新 token → 继续用，不删
+                    latest = self._load_json(self._token_path(qq))
+                    if (
+                        latest
+                        and latest.get("access_token")
+                        and latest.get("access_token") != base.get("access_token")
+                        and time.time() <= latest.get("expires_at_epoch", 0) - 300
+                    ):
+                        return latest["access_token"]
+                    # 授权已被官方吊销（refresh 无效）：本地 token 已无意义，删掉避免
+                    # 后续每次同步都白打一次 refresh；主动私聊提醒成员重新绑定，并登记
+                    # 运维告警让管理员知晓。
+                    self._token_path(qq).unlink(missing_ok=True)
+                    notify.enqueue(qq, self._REBIND_NOTICE)
+                    alert.record(
+                        "coros:revoked",
+                        f"COROS 授权被官方吊销（已私聊提醒成员 {qq} 重新绑定）",
+                    )
+                    raise RuntimeError("COROS 授权已失效，请重新发送「绑定 coros」授权") from None
         return token["access_token"]
 
     def _refresh(self, qq: str, token: dict) -> dict:
@@ -325,32 +355,65 @@ class CorosProvider(SportProvider):
         return stats
 
     def _call_tool(self, qq: str, name: str, arguments: dict, req_id: int = 1) -> str:
-        """调用 COROS MCP 工具并返回解码后的 text（stateless JSON-RPC）。"""
+        """调用 COROS MCP 工具并返回解码后的 text（stateless JSON-RPC）。
+
+        - 401（token 被服务端提前判失效）：强制刷新一次后重试一次；
+        - 响应体兼容纯 JSON 与 SSE（``data: {...}``），服务端时而不按 Accept 返回。
+        """
         token = self._ensure_token(qq)
-        r = httpx.post(
-            self._mcp_url,
-            json={
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            },
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-                **self._UA,
-            },
-            timeout=30,
-        )
+        for attempt in (0, 1):
+            r = httpx.post(
+                self._mcp_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                    **self._UA,
+                },
+                timeout=30,
+            )
+            if r.status_code == 401 and attempt == 0:
+                stored = self._load_json(self._token_path(qq))
+                if not stored:
+                    break
+                token = self._refresh(qq, stored)
+                continue
+            break
         r.raise_for_status()
-        result = r.json().get("result") or {}
+        payload = self._parse_rpc_body(r)
+        result = payload.get("result") or {}
         if result.get("isError"):
             raise RuntimeError(f"COROS MCP 调用失败：{result}")
         for c in result.get("content", []):
             if c.get("type") == "text":
                 return self._decode_text(c.get("text", ""))
         return ""
+
+    @staticmethod
+    def _parse_rpc_body(resp) -> dict:
+        """解析 JSON-RPC 响应体：优先 JSON，失败则按 SSE 取最后一个 ``data:`` 行。"""
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                return payload
+        except ValueError:
+            pass
+        for line in reversed(resp.text.splitlines()):
+            if not line.startswith("data:"):
+                continue
+            try:
+                payload = json.loads(line[len("data:") :].strip())
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise RuntimeError(f"COROS MCP 响应无法解析：{resp.text[:200]}")
 
     def _query_daily_health(self, qq: str, days: int) -> str:
         return self._call_tool(qq, "queryDailyHealthData", {"days": days})
@@ -397,15 +460,15 @@ class CorosProvider(SportProvider):
         stats = DailyStats(date=d)
         day_str = d.strftime("%Y%m%d")
 
-        m = re.search(r"Resting HR:\s*(\d+)", text)
-        if m:
-            stats.resting_hr = int(m.group(1))
-
         blocks = re.split(r"---\s*(\d{8})\s*---", text)
         for i in range(1, len(blocks), 2):
             if blocks[i] != day_str:
                 continue
             body = blocks[i + 1]
+            # Resting HR 必须限定在本日块内：多日文本里直接 re.search 会取到别的日期
+            m = re.search(r"Resting HR:\s*(\d+)", body)
+            if m:
+                stats.resting_hr = int(m.group(1))
             m = re.search(r"Steps:\s*([\d,]+)", body)
             if m:
                 stats.steps = int(m.group(1).replace(",", ""))

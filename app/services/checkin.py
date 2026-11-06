@@ -11,6 +11,7 @@
 """
 
 import random
+import threading
 from collections import Counter
 from datetime import date, timedelta
 
@@ -22,6 +23,9 @@ from ..config import settings
 from ..models.checkin_day import CheckinDay
 from ..models.checkin_state import CheckinState
 from . import timeutil
+
+# 礼物名额「先数已领人数、再插入自己」的进程内互斥（单进程 Bot 足够串行化并发领取）
+_claim_lock = threading.Lock()
 
 # —— 个人打卡里程碑：累计打卡天数达这些值时触发鼓励彩蛋（可自行增删）——
 MILESTONES = [10, 66, 88, 99, 100, 200, 300, 365]
@@ -228,10 +232,21 @@ def _festival_key(name: str, year: int, qq: str) -> str:
 
 
 def _mark_state(key: str, session: Session) -> bool:
-    """写一条触发状态（幂等），返回是否为首次写入。"""
+    """写一条触发状态（幂等），返回是否为首次写入。
+
+    与 ensure_day 同款 savepoint：并发下两个线程可能同时 ``get`` 到 None，
+    后提交者直接 add 会在 commit 时抛 IntegrityError，把调用方整笔事务
+    （例如整张截图的打卡落库）一起回滚。这里提前 flush 并捕获冲突，
+    只回滚本次 add，视为「已被别人抢先写入」。
+    """
     if session.get(CheckinState, key) is not None:
         return False
-    session.add(CheckinState(key=key))
+    try:
+        with session.begin_nested():
+            session.add(CheckinState(key=key))
+            session.flush()
+    except IntegrityError:
+        return False
     return True
 
 
@@ -314,13 +329,19 @@ def auto_gift(qq: str, total: int, session: Session) -> int | None:
 
     幂等由 CheckinState（gift:<GIFT_DAYS>:<qq>）保证，重复触发不会重复领取。
     供截图/今日路径在成员跨过 GIFT_DAYS 时自动触发，无需成员手动发「领礼物」。
+
+    「先数已领人数、再插入自己」必须原子：两人同一天达 GIFT_DAYS 时，
+    并发下都可能读到 before=9 而双双领取，超出 GIFT_QUOTA。机器人是单进程，
+    这里用模块级锁串行化这一小段（DB 侧另有 savepoint 兜底唯一约束）。
     """
     if total < GIFT_DAYS:
         return None
-    if session.get(CheckinState, _gift_key(qq)) is not None:
-        return None
-    before = gift_claims(session)
-    if before >= GIFT_QUOTA:
-        return None
-    claim_gift(qq, session)
-    return before + 1
+    with _claim_lock:
+        if session.get(CheckinState, _gift_key(qq)) is not None:
+            return None
+        before = gift_claims(session)
+        if before >= GIFT_QUOTA:
+            return None
+        if not _mark_state(_gift_key(qq), session):
+            return None
+        return before + 1

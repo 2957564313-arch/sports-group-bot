@@ -72,11 +72,15 @@ _DIST_ALIASES = {
 
 
 def _parse_distance(token: str) -> float | None:
-    """解析距离 token（如 5k / 10km / 21.0975 / 半马 / 全马），返回公里数。"""
+    """解析距离 token（如 5k / 10km / 21.0975 / 半马 / 全马），返回公里数。
+
+    数字部分用严格正则（整数或一位小数点），避免 "." / "1.2.3" 这类 OCR 脏串
+    让 float() 抛 ValueError 冒到群里。
+    """
     t = token.strip().lower()
     if t in _DIST_ALIASES:
         return _DIST_ALIASES[t]
-    m = re.match(r"^([\d.]+)\s*(km|k|公里|m|米)?$", t)
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(km|k|公里|m|米)?$", t)
     if not m:
         return None
     val = float(m.group(1))
@@ -96,7 +100,7 @@ def _parse_time(token: str) -> int | None:
         for p in parts:
             secs = secs * 60 + int(p)
         return secs
-    m = re.match(r"^([\d.]+)\s*(分|分钟|min|秒|s|sec)?$", t, re.IGNORECASE)
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(分|分钟|min|秒|s|sec)?$", t, re.IGNORECASE)
     if not m:
         return None
     val = float(m.group(1))
@@ -174,14 +178,21 @@ def _fmt_duration(sec: float) -> str:
 
 
 def _recent_records(session: Session, qq: str, days: int) -> list[DailyRecord]:
+    """近 N 天的日记录，**按日期倒序**（最新在前）。
+
+    显式排序，不能依赖 SQLite 的返回顺序：心率区间取「最新一条有平均心率」的记录时，
+    若按插入顺序倒着找，会拿到几天前的心率而不是最近一次训练的心率。
+    """
     start = timeutil.today() - timedelta(days=days - 1)
     return (
         session.execute(
-            select(DailyRecord).where(
+            select(DailyRecord)
+            .where(
                 DailyRecord.member_qq == qq,
                 DailyRecord.record_date >= start,
                 DailyRecord.record_date <= timeutil.today(),
             )
+            .order_by(DailyRecord.record_date.desc())
         )
         .scalars()
         .all()
@@ -234,13 +245,25 @@ def hr_max_from_age(age: int) -> int:
     return int(round(208 - 0.7 * age))
 
 
+def _signed_num(value: float) -> str:
+    """带符号数值格式化：0 与 -0.0 都输出 "0.0"，避免出现 "+-0.0"。"""
+    v = round(float(value), 1)
+    if v == 0:
+        return "0.0"
+    return f"+{v}" if v > 0 else str(v)
+
+
 def heart_rate_zones(age: int, resting_hr: int) -> list[tuple[str, int, int, str]]:
     """按 Karvonen 储备心率法计算五区间，返回 [(区间名, 下限bpm, 上限bpm, 说明), ...]。
 
     HR = 静息心率 + %HRR × (HRmax − 静息心率)，HRmax 用 Tanaka 公式估算。
+    静息心率 ≥ 估算最大心率（年龄录入错误 / 设备读数异常）时储备心率为负，
+    区间会整体倒挂——此时返回空列表，让上层按「数据不足」跳过而不是输出错结论。
     """
     hr_max = hr_max_from_age(age)
     hrr = hr_max - resting_hr
+    if hrr <= 0:
+        return []
     out = []
     for label, lo_pct, hi_pct, note in _HR_ZONES:
         low = int(round(resting_hr + lo_pct * hrr))
@@ -360,6 +383,15 @@ def compute_load_status(session: Session, qq: str, today=None) -> dict | None:
             series.append(daily_trimp(r[2] or 0, r[3] or 0, r[4] or 0, hr_max))
         else:
             series.append(r[1] or 0.0)
+
+    # 选了 TRIMP 但全为 0（静息心率 ≥ 估算最大心率 / 心率数据全异常）→ 退回跑量基线，
+    # 否则 CTL=ATL=0、ratio=0，会输出「正常训练状态」这种假结论。
+    if basis == "trimp" and not any(series):
+        basis = "km"
+        series = []
+        for i in range(_LOAD_HISTORY_DAYS):
+            r = by_day.get(start + timedelta(days=i))
+            series.append((r[1] or 0.0) if r is not None else 0.0)
 
     ctl = _ewma(series, _CTL_DAYS)
     atl = _ewma(series, _ATL_DAYS)
@@ -529,10 +561,16 @@ def compute_diagnosis(
             }
         )
 
-    # 训练负荷：急性（近7天跑量） vs 慢性（近4周周均跑量）
+    # 训练负荷：急性（近7天跑量） vs 慢性（有数据周的周均跑量）
     acute = buckets[0]["distance"]
-    chronic_weekly = round(sum(b["distance"] for b in buckets) / _WEEKS, 2)
-    acwr = round(acute / chronic_weekly, 2) if chronic_weekly > 0 else None
+    # 只按「有运动数据的周」求周均：新成员只有 1~2 周数据时，若固定除以 4 周，
+    # 慢性负荷会被系统性低估，ACWR 虚高到 4.0 并误报「骤增受伤风险」。
+    active_weeks = sum(1 for b in buckets if b["active_days"] > 0)
+    chronic_weekly = (
+        round(sum(b["distance"] for b in buckets) / active_weeks, 2) if active_weeks else 0.0
+    )
+    # 少于 2 周有效数据时 ACWR 没有可比基线，直接判「数据不足」而不是硬算
+    acwr = round(acute / chronic_weekly, 2) if chronic_weekly > 0 and active_weeks >= 2 else None
     acwr_verdict = _acwr_level(acwr) if acwr is not None else None
 
     # 恢复信号：近 7 天睡眠均值 + 静息心率变化（相对前一周）
@@ -588,19 +626,21 @@ def compute_diagnosis(
         resting = recovery["resting_hr"]
         if resting:
             zones = heart_rate_zones(member.age, resting)
-            latest_hr = next((r.avg_hr for r in reversed(records) if (r.avg_hr or 0) > 0), 0)
-            idx, verdict = zone_for_avg_hr(zones, latest_hr)
-            result["hr_zones"] = {
-                "age": member.age,
-                "hr_max": hr_max_from_age(member.age),
-                "resting_hr": resting,
-                "zones": zones,
-                "avg_hr": latest_hr or None,
-                "zone_index": idx,
-                "verdict": verdict,
-            }
-            # 强度分布（极化训练检验）：与心率区间同源（年龄+静息+近7天平均心率）
-            result["intensity"] = intensity_distribution(last7, member.age, resting)
+            # 静息心率 ≥ 估算最大心率时 zones 为空（区间倒挂），跳过而不是输出错区间
+            if zones:
+                latest_hr = next((r.avg_hr for r in records if (r.avg_hr or 0) > 0), 0)
+                idx, verdict = zone_for_avg_hr(zones, latest_hr)
+                result["hr_zones"] = {
+                    "age": member.age,
+                    "hr_max": hr_max_from_age(member.age),
+                    "resting_hr": resting,
+                    "zones": zones,
+                    "avg_hr": latest_hr or None,
+                    "zone_index": idx,
+                    "verdict": verdict,
+                }
+                # 强度分布（极化训练检验）：与心率区间同源（年龄+静息+近7天平均心率）
+                result["intensity"] = intensity_distribution(last7, member.age, resting)
 
     # 负荷状态（CTL/ATL/TSB，TRIMP 或跑量 EWMA）
     result["load_status"] = compute_load_status(session, qq, today)
@@ -677,14 +717,14 @@ def format_diagnosis(result: dict, name: str) -> str:
                 f"· CTL（42 天慢性负荷）≈ {ls['ctl']} {unit}/天，"
                 f"ATL（7 天急性负荷）≈ {ls['atl']} {unit}/天"
             )
-            tsb_str = f"+{ls['tsb']}" if ls["tsb"] >= 0 else str(ls["tsb"])
+            tsb_str = _signed_num(ls["tsb"])
             lines.append(f"· TSB = {tsb_str} {unit} —— {ls['verdict']}")
             lines.append("·（按训练冲量 TRIMP 估算：时长 × 心率强度指数，含强度信息）")
         else:
             lines.append(
                 f"· CTL（42 天慢性负荷）≈ {ls['ctl']} km/天，ATL（7 天急性负荷）≈ {ls['atl']} km/天"
             )
-            tsb_str = f"+{ls['tsb']}" if ls["tsb"] >= 0 else str(ls["tsb"])
+            tsb_str = _signed_num(ls["tsb"])
             lines.append(f"· TSB = {tsb_str} km —— {ls['verdict']}")
             lines.append("·（跑量负荷不含强度信息，阈值是经验参考区间，仅作趋势提示）")
 

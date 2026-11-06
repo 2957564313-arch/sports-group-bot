@@ -1,6 +1,6 @@
 [project]
 name = "sports-group-bot"
-version = "0.2.0"
+version = "0.3.0"
 description = "QQ 群运动数据机器人：Garmin/COROS 平台接入 + 截图 OCR 打卡 + 排行播报 + 科学训练分析（NoneBot2 + OneBot v11，MIT 开源，开箱可嫁接）"
 requires-python = ">=3.10"
 dependencies = [

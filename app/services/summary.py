@@ -44,7 +44,7 @@ def compute_member_summary(qq: str, start: date, end: date, session: Session | N
         if own_session:
             session.close()
 
-    active_days = 0
+    active_dates: set[date] = set()
     activities = 0
     distance = 0.0
     ascent = 0.0
@@ -57,9 +57,9 @@ def compute_member_summary(qq: str, start: date, end: date, session: Session | N
     hr_w = 0.0  # 时长权重
 
     for r in rows:
-        # 距离/时长/消耗任一项 >0 即视为「运动日」
+        # 距离/时长/消耗任一项 >0 即视为「运动日」；同一天多平台各一行，按日期去重
         if is_active_day(r.distance_km, r.active_minutes, r.calories):
-            active_days += 1
+            active_dates.add(r.record_date)
         activities += r.activities_count or 0
         distance += r.distance_km or 0.0
         ascent += r.ascent_meters or 0.0
@@ -78,7 +78,7 @@ def compute_member_summary(qq: str, start: date, end: date, session: Session | N
             hr_w += mins
 
     return {
-        "active_days": active_days,
+        "active_days": len(active_dates),
         "activities": activities,
         "distance_km": round(distance, 2),
         "ascent_meters": round(ascent, 2),
@@ -102,31 +102,44 @@ def parse_range(text: str) -> tuple[date, date, str] | None:
         return None
     today = timeutil.today()
 
-    # 近 N 天：近30天 / 最近30天 / 过去7天
+    # 近 N 天：近30天 / 最近30天 / 过去7天（N 上限一年，避免超大区间拖垮查询）
     m = re.search(r"(?:近|最近|过去)\s*(\d+)\s*天", t)
     if m:
         n = int(m.group(1))
+        if not 1 <= n <= 3660:
+            return None
         return today - timedelta(days=n - 1), today + timedelta(days=1), f"近{n}天"
 
-    # 近 N 个月：近3个月 / 最近3个月
+    # 近 N 个月：近3个月 / 最近3个月（N 上限 120，避免 while 循环退化成死循环）
     m = re.search(r"(?:近|最近|过去)\s*(\d+)\s*个?\s*月", t)
     if m:
         n = int(m.group(1))
+        if not 1 <= n <= 120:
+            return None
         y, mo = today.year, today.month - n
         while mo <= 0:
             mo += 12
             y -= 1
         return date(y, mo, 1), today + timedelta(days=1), f"近{n}个月"
 
-    # 指定年月：8月 / 2026年8月 / 2026-8
-    m = re.search(r"(?:(\d{4})\s*[年\-/])?\s*(\d{1,2})\s*月", t)
+    # 指定年月：8月 / 2026年8月 / 2026-8（年份与月份之间有分隔符时「月」可省）
+    m = re.search(r"(\d{4})\s*[年\-/]\s*(\d{1,2})\s*月?", t)
     if m:
-        mo = int(m.group(2))
+        y, mo = int(m.group(1)), int(m.group(2))
         if not 1 <= mo <= 12:
             return None
-        y = int(m.group(1)) if m.group(1) else today.year
+        start = date(y, mo, 1)
+        end = date(y + 1, 1, 1) if mo == 12 else date(y, mo + 1, 1)
+        return start, end, f"{y}年{mo}月"
+
+    m = re.search(r"(\d{1,2})\s*月", t)
+    if m:
+        mo = int(m.group(1))
+        if not 1 <= mo <= 12:
+            return None
+        y = today.year
         # 只写「8月」且该月尚未到（未来）→ 视为去年（跨年查询，如今年 1 月查「12月」）
-        if m.group(1) is None and mo > today.month:
+        if mo > today.month:
             y -= 1
         start = date(y, mo, 1)
         end = date(y + 1, 1, 1) if mo == 12 else date(y, mo + 1, 1)

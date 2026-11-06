@@ -197,6 +197,10 @@ async def _process_one(bot: Bot, group_id: int, qq: str, seg: dict, md5s: set[st
         return "unrecognized"
     if bound:
         return "bound"
+    if not data.get("distance_km"):
+        # 只有步数/心率等非距离数据：没有距离可写入累计，按未识别处理。
+        # 直接 data["distance_km"] 会 KeyError，被上层 broad except 吞成「数据不合理」。
+        return "unrecognized"
 
     # 落盘（与正常链路同目录，供「已记录」去重与后续排查）
     try:

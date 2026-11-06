@@ -14,7 +14,7 @@ from ..models.checkin_log import CheckinLog
 from ..models.daily_record import DailyRecord
 from ..models.manual_distance import ManualDistance
 from ..models.member import Member
-from . import checkin, parsers, timeutil
+from . import alert, checkin, parsers, timeutil
 from .providers import get_provider
 from .providers.base import DailyStats
 
@@ -366,8 +366,11 @@ def sync_history(qq: str, platform: str, start: date, end: date) -> int:
         try:
             stats_list = provider.fetch_range(qq, start, end)
         except Exception as e:
+            # 不能把异常吞成「成功回填 0 天」：管理员会误以为历史已补齐，而周榜/月榜
+            # 一直缺数据。上抛让调用方显式失败，并登记运维告警。
             logger.warning(f"回填 {qq}（{provider.name}）失败: {e}")
-            return 0
+            alert.record("sync:backfill", f"回填 {qq}（{provider.name}）历史数据失败：{e}")
+            raise RuntimeError(f"{provider.name} 历史数据拉取失败：{e}") from e
         done = 0
         for stats in stats_list:
             _write_record(qq, stats.date, provider.name, stats, session)
@@ -388,7 +391,6 @@ def sync_today_all(exclude_qq: str | None = None) -> int:
     再全量同步一遍纯属重复拉取，跳过可省一次登录/网络往返。
     """
     global _sync_today_all_at
-    _sync_today_all_at = time.time()  # 记录本次全量同步时刻，供节流复用
     session = get_session()
     try:
         targets = [
@@ -408,6 +410,9 @@ def sync_today_all(exclude_qq: str | None = None) -> int:
             ok += 1
         except Exception as e:
             logger.warning(f"同步 {qq}（{platform}）今日数据失败: {e}")
+    # 时间戳在整轮结束后才推进：中途异常（SQLite 锁/迁移未完成）不应让后续 10 分钟
+    # 内的「今日」「名次」都跳过同步、长期展示旧数据。
+    _sync_today_all_at = time.time()
     return ok
 
 

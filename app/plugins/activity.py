@@ -11,6 +11,7 @@
 不参与前一天提醒；手动活动同日覆盖固定活动。
 """
 
+import asyncio
 import re
 from datetime import date, timedelta
 
@@ -20,6 +21,7 @@ from nonebot.log import logger
 from nonebot.params import CommandArg
 from sqlalchemy import select
 
+from ..config import settings
 from ..db import get_session
 from ..models.activity import Activity
 from ..services import timeutil
@@ -60,9 +62,19 @@ def _parse_date(s: str) -> date | None:
         except ValueError:
             return None
         if dt < today:
-            dt = date(today.year + 1, mo, d)
+            try:
+                dt = date(today.year + 1, mo, d)
+            except ValueError:
+                # 闰日跨年（如当年闰年已过的 2-29）→ 无法解析，不抛 ValueError
+                return None
         return dt
     return None
+
+
+def _start_ym() -> tuple[int, int]:
+    """活动体系起始年月（settings.activity_start_month，已在校验器里规范化）。"""
+    y_s, m_s = settings.activity_start_month.split("-")
+    return int(y_s), int(m_s)
 
 
 def _split_time_location(rest: str) -> tuple[str, str]:
@@ -124,6 +136,8 @@ async def handle_list(bot: Bot, event: MessageEvent, args: Message = CommandArg(
             if not m:
                 await list_cmd.finish("月份格式：YYYY-MM（如 2026-10）")
             y, mo = map(int, m.groups())
+            if not 1 <= mo <= 12:
+                await list_cmd.finish("月份格式：YYYY-MM（如 2026-10）")
             start, end = date(y, mo, 1), _next_month(date(y, mo, 1))
             title = f"{y}年{mo}月"
         else:
@@ -266,7 +280,7 @@ async def handle_preview(bot: Bot, event: MessageEvent):
     today = timeutil.today()
     next_first = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
     try:
-        path = build_calendar_image(next_first.year, next_first.month)
+        path = await asyncio.to_thread(build_calendar_image, next_first.year, next_first.month)
     except Exception as e:
         logger.warning(f"生成 {next_first.year}-{next_first.month} 预览月历失败: {e}")
         await preview_cmd.finish("生成月历失败，请稍后再试")
@@ -288,10 +302,13 @@ async def handle_month(bot: Bot, event: MessageEvent, args: Message = CommandArg
     if not m or not 1 <= int(m.group(2)) <= 12:
         await month_cmd.finish("用法：月历 YYYY-MM（如 月历 2026-11）")
     y, mo = int(m.group(1)), int(m.group(2))
-    if (y, mo) < (2026, 10):
-        await month_cmd.finish()  # 2026-10 之前无活动数据，按约定不回应
+    if (y, mo) < _start_ym():
+        # 起始月份之前没有活动数据：给明确提示，而不是零反馈地 finish（用户会以为没生效）
+        await month_cmd.finish(
+            f"{y}年{mo}月还没有活动记录（活动从 {settings.activity_start_month} 开始）"
+        )
     try:
-        path = build_calendar_image(y, mo)
+        path = await asyncio.to_thread(build_calendar_image, y, mo)
     except Exception as e:
         logger.warning(f"生成 {y}-{mo:02d} 月历失败: {e}")
         await month_cmd.finish("生成月历失败，请稍后再试")

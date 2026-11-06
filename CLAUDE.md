@@ -54,3 +54,4 @@ python bot.py
 | 训练诊断 | `app/services/diagnose.py`（确定性公式，非 LLM） |
 | 数据库迁移 | `app/db.py` 的 `_MIGRATIONS`（只 ADD COLUMN，幂等） |
 | 运维告警 / 成员提醒 | `services/alert.py` / `services/notify.py` |
+| 主机运维 / 掉线应急 | `local/nuc-runbook.md` + `local/nuc.py`（**本地私有，.gitignore 排除，不入库、不上传**） |

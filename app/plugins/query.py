@@ -135,70 +135,74 @@ async def build_today(qq: str, nickname: str, bot=None, gid=None) -> str:
     已绑定平台走接口同步；未绑定读当日截图记录 + 累计里程。
     """
     today = timeutil.today()
+    # 先把需要的字段读成普通值再关 session：后面的平台同步是 to_thread + 网络 IO，
+    # 若持有 session 等待，会一直占着连接与 WAL 读快照（池默认 5，并发查询会排队）。
     session = get_session()
     try:
         member = session.get(Member, qq)
+        platform = member.platform if member is not None else ""
         if member is not None:
             nickname = member.display_name
-
-        # 已绑定平台 → 走平台接口同步
-        if member is not None and member.platform:
-            stats = await asyncio.to_thread(sync.sync_daily, member.qq, member.platform, today)
-            text = f"{nickname} 今日运动数据：\n{_format_stats(stats)}"
-            # 「今日群内第 N 名」需全群当天数据齐全（截图 + 绑定成员同口径），
-            # 补齐其它绑定成员（带节流）；失败不阻断查询，名次可能略旧。
-            try:
-                await asyncio.to_thread(sync.sync_today_all_throttled, exclude_qq=member.qq)
-            except Exception as e:
-                logger.warning(f"同步全员今日数据失败（今日名次可能不全）: {e}")
-            text += f"\n\n{_checkin_badge(qq)}"
-            text += await _milestone_cheers(qq, nickname, bot, gid)
-            text += await _daily_cheer(nickname, stats)
-            return text
-
-        # 未绑定 → 读截图记录（当日明细 + 累计里程）
-        rec = session.execute(
-            select(DailyRecord).where(
-                DailyRecord.member_qq == qq,
-                DailyRecord.record_date == today,
-                DailyRecord.platform == "manual",
+        rec = total = week = None
+        day_logs: list[CheckinLog] = []
+        if not platform:
+            rec = session.execute(
+                select(DailyRecord).where(
+                    DailyRecord.member_qq == qq,
+                    DailyRecord.record_date == today,
+                    DailyRecord.platform == "manual",
+                )
+            ).scalar_one_or_none()
+            total = sync.get_manual_distance(qq, session)
+            week = sync.get_week_distance(qq, session)
+            # 当天多场运动（≥2 次截图）逐条列出：帮成员确认「早上/晚上」每一场都记上了，
+            # 时段来自截图识别的开始时间（识别不出则按顺序编号）。
+            day_logs = (
+                session.execute(
+                    select(CheckinLog)
+                    .where(CheckinLog.member_qq == qq, CheckinLog.record_date == today)
+                    .order_by(CheckinLog.id)
+                )
+                .scalars()
+                .all()
             )
-        ).scalar_one_or_none()
-        total = sync.get_manual_distance(qq, session)
-        week = sync.get_week_distance(qq, session)
-
-        if rec is None and total <= 0:
-            return (
-                "还没开张呢，动起来就有数据啦 💪 试试下面任一方式：\n"
-                "① 绑定平台：发「绑定 garmin」（佳明，私聊填账号）或「绑定 coros」（高驰，私密授权链接）\n"
-                "② 其他平台（无开放接口的 App）：直接发运动截图，我会自动识别并记入今日数据和排行\n"
-                "绑定后发「今日」即可查询当日数据"
-            )
-
-        text = _format_manual(nickname, today, rec, total, week)
-        # 当天多场运动（≥2 次截图）逐条列出：帮成员确认「早上/晚上」每一场都记上了，
-        # 时段来自截图识别的开始时间（识别不出则按顺序编号）。
-        day_logs = (
-            session.execute(
-                select(CheckinLog)
-                .where(CheckinLog.member_qq == qq, CheckinLog.record_date == today)
-                .order_by(CheckinLog.id)
-            )
-            .scalars()
-            .all()
-        )
-        if len(day_logs) >= 2:
-            lines = []
-            for i, lg in enumerate(day_logs, 1):
-                label = cheers.day_period(lg.start_minute) or f"第 {i} 次"
-                lines.append(f"· {label}：{lg.distance_km} km")
-            text += "\n\n📋 今日明细：\n" + "\n".join(lines)
-        text += f"\n\n{_checkin_badge(qq)}"
-        text += await _milestone_cheers(qq, nickname)
-        text += await _daily_cheer(nickname, rec)
-        return text
     finally:
         session.close()
+
+    # 已绑定平台 → 走平台接口同步
+    if platform:
+        stats = await asyncio.to_thread(sync.sync_daily, qq, platform, today)
+        text = f"{nickname} 今日运动数据：\n{_format_stats(stats)}"
+        # 「今日群内第 N 名」需全群当天数据齐全（截图 + 绑定成员同口径），
+        # 补齐其它绑定成员（带节流）；失败不阻断查询，名次可能略旧。
+        try:
+            await asyncio.to_thread(sync.sync_today_all_throttled, exclude_qq=qq)
+        except Exception as e:
+            logger.warning(f"同步全员今日数据失败（今日名次可能不全）: {e}")
+        text += f"\n\n{_checkin_badge(qq)}"
+        text += await _milestone_cheers(qq, nickname, bot, gid)
+        text += await _daily_cheer(nickname, stats)
+        return text
+
+    if rec is None and (total or 0) <= 0:
+        return (
+            "还没开张呢，动起来就有数据啦 💪 试试下面任一方式：\n"
+            "① 绑定平台：发「绑定 garmin」（佳明，私聊填账号）或「绑定 coros」（高驰，私密授权链接）\n"
+            "② 其他平台（无开放接口的 App）：直接发运动截图，我会自动识别并记入今日数据和排行\n"
+            "绑定后发「今日」即可查询当日数据"
+        )
+
+    text = _format_manual(nickname, today, rec, total or 0, week or 0)
+    if len(day_logs) >= 2:
+        lines = []
+        for i, lg in enumerate(day_logs, 1):
+            label = cheers.day_period(lg.start_minute) or f"第 {i} 次"
+            lines.append(f"· {label}：{lg.distance_km} km")
+        text += "\n\n📋 今日明细：\n" + "\n".join(lines)
+    text += f"\n\n{_checkin_badge(qq)}"
+    text += await _milestone_cheers(qq, nickname)
+    text += await _daily_cheer(nickname, rec)
+    return text
 
 
 @query_cmd.handle()

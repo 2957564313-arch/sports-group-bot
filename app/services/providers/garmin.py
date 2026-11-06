@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from garminconnect import Garmin
 from nonebot.log import logger
 
-from .. import credentials
+from .. import alert, credentials, notify
 from .base import DailyStats, SportProvider
 
 
@@ -57,8 +57,27 @@ class GarminProvider(SportProvider):
     def fetch_daily(self, qq: str, d: date) -> DailyStats:
         cred = self._require_cred(qq)
         client = Garmin(cred["email"], cred["password"], is_cn=cred.get("is_cn", True))
-        client.login()
+        try:
+            client.login()
+        except Exception as e:
+            self._handle_login_failure(qq, e)
+            raise
         return self._fetch_day(client, d)
+
+    # 登录态失效时私聊提醒成员重新绑定（与 COROS 同款文案风格）
+    _REBIND_NOTICE = (
+        "⚠️ 你的佳明（Garmin）账号登录已失效，今日起运动数据无法自动同步。\n"
+        "请私聊我重新发送「绑定 garmin」更新密码，完成后数据照常统计～"
+    )
+
+    def _handle_login_failure(self, qq: str, exc: Exception) -> None:
+        """登录失败时区分「凭据失效」与「网络抖动」，前者提醒成员并登记告警。"""
+        text = str(exc).lower()
+        auth_like = any(k in text for k in ("auth", "401", "403", "credential", "password"))
+        if not auth_like and "unauthorized" not in type(exc).__name__.lower():
+            return
+        notify.enqueue(qq, self._REBIND_NOTICE)
+        alert.record("garmin:auth", f"佳明登录失效（已私聊提醒成员 {qq} 重新绑定）")
 
     def fetch_range(self, qq: str, start: date, end: date) -> list[DailyStats]:
         """一次登录复用会话，逐日拉取 ``[start, end)`` 的统计数据（回填历史）。
@@ -69,7 +88,11 @@ class GarminProvider(SportProvider):
         """
         cred = self._require_cred(qq)
         client = Garmin(cred["email"], cred["password"], is_cn=cred.get("is_cn", True))
-        client.login()
+        try:
+            client.login()
+        except Exception as e:
+            self._handle_login_failure(qq, e)
+            raise
         out: list[DailyStats] = []
         d = start
         while d < end:

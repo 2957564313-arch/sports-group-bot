@@ -161,13 +161,17 @@ def parse_activity(text: str) -> dict:
 
     v = _nearby_number(text, ["步数", "steps"])
     if v is not None:
-        data["steps"] = int(_normalize_number(v))
+        iv = _as_int(v)
+        if iv is not None:
+            data["steps"] = iv
 
     v = _nearby_number(
         text, ["消耗", "卡路里", "千卡", "干卡", "大卡", "kcal", "kilocalorie", "calorie"]
     )
     if v is not None:
-        data["calories"] = int(_normalize_number(v))
+        iv = _as_int(v)
+        if iv is not None:
+            data["calories"] = iv
 
     minutes = _nearby_duration(
         text, ["运动时长", "运动时间", "时长", "时间", "duration", "workout time"]
@@ -191,7 +195,9 @@ def parse_activity(text: str) -> dict:
 
     v = _nearby_number(text, ["平均心率", "avg hr", "average hr", "心率"])
     if v is not None:
-        data["avg_hr"] = int(_normalize_number(v))
+        iv = _as_int(v)
+        if iv is not None:
+            data["avg_hr"] = iv
 
     return data
 
@@ -465,15 +471,46 @@ def _make_scaled_extractor(spec):
     return _extract
 
 
+def _as_int(value) -> int | None:
+    """把 OCR 数值转 int：先 float 再四舍五入，容错小数/脏串。
+
+    直接 ``int("8500.5")`` 会抛 ValueError；而调用点常在整张图的 try 里，
+    异常会让同一张截图里已经解析出的距离一起丢掉（且不触发视觉兜底）。
+    """
+    try:
+        return int(round(float(_normalize_number(str(value)))))
+    except (TypeError, ValueError):
+        return None
+
+
 def _iter_items(result) -> list:
-    """把 OCR result 规范成带坐标的 dict 列表（按文本非空过滤）。"""
+    """把 OCR result 规范成带坐标的 dict 列表（按文本非空过滤）。
+
+    容错：OCR 引擎/上游若给出扁平坐标（``[x1,y1,x2,y2]``）或空框，跳过该行，
+    而不是抛 ValueError / ZeroDivisionError —— 后者会被上层吞掉，表现为整张图静默失败。
+    """
     items = []
-    for box, text, _score in result:
+    for row in result or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        box, text = row[0], row[1]
+        if not isinstance(box, (list, tuple)) or not box:
+            continue
+        points = []
+        for p in box:
+            if not isinstance(p, (list, tuple)) or len(p) < 2:
+                continue
+            try:
+                points.append((float(p[0]), float(p[1])))
+            except (TypeError, ValueError):
+                continue
+        if not points:
+            continue
         t = str(text).strip()
         if not t:
             continue
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
         items.append(
             {
                 "text": t,
@@ -497,6 +534,14 @@ _CANDIDATE_RANGES = {
     "avg_pace_sec_per_km": (30.0, 1800.0),
     "avg_hr": (30.0, 250.0),
 }
+
+
+def _nonzero(v) -> bool:
+    """判断提取值（可能是原始字符串）按数值是否为非零；无法解析视为非零（交给 _plausible）。"""
+    try:
+        return float(_normalize_number(str(v))) != 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _plausible(spec: dict, v) -> bool:
@@ -591,10 +636,15 @@ def _extract_field(items, spec):
             # 短标签子串陷阱：避免「心率」误匹配「最大心率」等带修饰词的框
             if any(q in t for q in _QUALIFIER_WORDS):
                 continue
-            # 标签框自身含数字 → 是「距离 6.23 公里」「海拔爬升为 0」这类描述/合并句，
-            # 不是纯标签。当作锚点会把相邻句的数值交叉关联（距离取到爬升的 0、爬升取到
-            # 距离的 6.23）。真正的纯标签（距离/配速/心率…）从不含数字，跳过安全。
+            # 标签框自身含数字 → 多半是「距离 6.23 公里」这类标签与数值同框的写法。
+            # 先尝试在该框内直接取值（否则真值会被整段跳过、整张图丢字段）；
+            # 取不到或不合理时再跳过，避免把它当锚点把相邻句的数值交叉关联。
             if re.search(r"\d", t):
+                v = extractor(t)
+                # v 为 0 的多半是「海拔爬升为 0」这类描述句里的修辞，不是真值
+                if v is not None and _nonzero(v) and _plausible(spec, v):
+                    it["_used"] = True
+                    return v
                 continue
             v = _value_near(items, it, extractor, spec)
             if v is not None:
@@ -702,11 +752,16 @@ def extract_workout_time(result) -> tuple[int, int] | None:
     if not items:
         return None
     max_y = max(it["cy"] for it in items)
-    for it in items:
+    # 按页面自上而下排序后取第一个命中：底部「记录于 21:10」之类的时间不会抢走
+    # 上方的真实开始时间（同一页可能同时出现开始时间与记录/上传时间）。
+    ordered = sorted(items, key=lambda it: it["cy"])
+    for it in ordered:
         m = _DATETIME_WITH_TIME.search(it["text"])
         if m:
             return int(m.group(1)), int(m.group(2))
-    for it in items:
+    for it in ordered:
+        if _near_duration_label(items, it):
+            continue
         m = _CN_PERIOD_TIME.search(it["text"])
         if m:
             return _cn_period_hour(m.group(1), int(m.group(2))), int(m.group(3))
@@ -890,12 +945,19 @@ def sanitize_activity(data: dict) -> tuple[dict, str | None]:
             dist = None
 
     # 交叉校验：距离与时长同时存在时，速度不能超过人类跑步极限。
-    # 距离是核心指标且已通过范围校验，超限更可能是时长 OCR 误读（如「1:30」被读成 1 分钟），
-    # 故温和丢弃时长、保留距离，而非整体拒绝（否则合法「5.2km / 1h30m」会被整图拒收）。
+    # 小距离（<25km）超限更可能是时长 OCR 误读（如「1:30」被读成 1 分钟），
+    # 温和丢弃时长、保留距离；但距离本身很大还「快到不可能」（5.02→52.0 这类
+    # 小数位放大 10 倍），保留距离会直接污染排行与累计里程，必须整体拒收。
     if reject is None and dist is not None and cleaned.get("active_minutes"):
         speed_kmh = dist / (cleaned["active_minutes"] / 60.0)
         if speed_kmh > _MAX_SPEED_KMH:
-            cleaned.pop("active_minutes", None)
+            if dist >= _SUSPICIOUS_DISTANCE_NO_DURATION_KM:
+                reject = (
+                    f"距离 {dist:g} km 与时长 {cleaned['active_minutes']} 分钟推出 "
+                    f"{speed_kmh:.0f} km/h，超过 {_MAX_SPEED_KMH:.0f} km/h 上限，疑似识别错误"
+                )
+            else:
+                cleaned.pop("active_minutes", None)
 
     # 其余字段超范围仅丢弃
     for key, (lo, hi) in _VALID_RANGES.items():
@@ -1031,9 +1093,9 @@ def same_workout_fields(a: dict, b) -> bool:
 
     判据刻意保守（宁可漏判重、也不误伤同一天两场真实运动）：
       - 距离为必要条件：两侧都有且相对差 ≤1%（绝对差 ≤0.03 km）——OCR 抖动范围；
-      - 至少再一个可比字段（时长/消耗/爬升/配速/心率）两侧都有且接近；
       - 参与比较的字段必须**全部**通过——任一项显著不同即判不同场；
-      - 只有距离一个可比字段时不判同场（两场距离接近的真实运动不能只靠距离合并）。
+      - 至少一个强字段（时长/消耗）一致，或两个弱字段（爬升/配速/心率）同时一致；
+        只有距离一个可比字段时不判同场（两场距离接近的真实运动不能只靠距离合并）。
     ``b`` 支持 dict 或带同名属性的对象（CheckinLog 等）。
     """
 
@@ -1045,7 +1107,8 @@ def same_workout_fields(a: dict, b) -> bool:
         return False
     if not _close_enough(da, db, 0.01, 0.03):
         return False
-    compared = 0
+    strong = 0
+    weak = 0
     for key, rel, abs_tol in (
         ("active_minutes", 0.03, 2.0),
         ("calories", 0.05, 15.0),
@@ -1056,7 +1119,12 @@ def same_workout_fields(a: dict, b) -> bool:
         va, vb = _g(a, key), _g(b, key)
         if not va or not vb:
             continue
-        compared += 1
         if not _close_enough(va, vb, rel, abs_tol):
             return False
-    return compared >= 1
+        if key in ("active_minutes", "calories"):
+            strong += 1
+        else:
+            weak += 1
+    # 单靠心率/配速这类弱辅助字段一致就判同场，会静默吞掉「两次跑步机 5km、心率接近」
+    # 里的第二场；要求强字段，或两个弱字段同时吻合。
+    return strong >= 1 or weak >= 2

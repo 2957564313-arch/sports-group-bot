@@ -1,8 +1,12 @@
-"""定时任务：每日排行播报 + 过期明细清理。
+"""定时任务：每日排行播报 + 过期明细清理 + 成员提醒。
 
 从 app/scheduler.py 归位到服务层。原「周聚合」任务与周汇总中间表已一并删除——
 周榜/月榜直接由 daily_record 聚合，无需中间表。
 过期明细清理从「每周一」改为「每日播报前」执行，幂等、更及时。
+
+调度纪律（见 CLAUDE.md）：榜单计算失败、Bot 掉线、某个群发送失败，都不得连带
+跳过后面的群抽奖 / 活动提醒 / 下月日历——它们各自独立 try，且「今日已播报」用
+checkin_state 打标记，重启或休眠错过时刻后可自动补播。
 """
 
 import asyncio
@@ -13,6 +17,7 @@ from nonebot.log import logger
 
 from ..config import settings
 from ..db import get_session
+from ..models.checkin_state import CheckinState
 from ..models.member import Member
 from . import activity, alert, checkin, notify, ranking, retention, sync, timeutil
 
@@ -38,6 +43,55 @@ def _lottery_if_due() -> tuple[int, list[str]] | None:
         return t, names
     finally:
         session.close()
+
+
+def _broadcast_key(day: datetime.date) -> str:
+    return f"broadcast:{day.isoformat()}"
+
+
+def _broadcast_done(day: datetime.date) -> bool:
+    """今天是否已经完成过一次播报（用于错过时刻后补播的幂等判据）。"""
+    session = get_session()
+    try:
+        return session.get(CheckinState, _broadcast_key(day)) is not None
+    finally:
+        session.close()
+
+
+def _mark_broadcast_done(day: datetime.date) -> None:
+    session = get_session()
+    try:
+        if session.get(CheckinState, _broadcast_key(day)) is None:
+            session.add(CheckinState(key=_broadcast_key(day)))
+            session.commit()
+    finally:
+        session.close()
+
+
+async def _send_private_alerts(alerts: list[tuple[str, str]], bots) -> None:
+    """把运维告警私聊给管理员；一条都没送达就把告警放回队列，下一轮再发。"""
+    if not alerts:
+        return
+    if not bots:
+        for key, msg in alerts:
+            alert.requeue(key, msg)
+        logger.warning("没有已连接的 Bot，运维告警暂存待重发")
+        return
+    text = f"⚠️ {settings.bot_name}运维提醒\n" + "\n".join(msg for _, msg in alerts)
+    for su in get_driver().config.superusers:
+        try:
+            user_id = int(su)
+        except (TypeError, ValueError):
+            continue
+        for bot in bots:
+            try:
+                await bot.send_private_msg(user_id=user_id, message=text)
+                return  # 一个 bot 发成功即可，避免多 bot 重复
+            except Exception as e:
+                logger.warning(f"发送运维告警失败（bot={getattr(bot, 'self_id', '?')}）: {e}")
+    for key, msg in alerts:
+        alert.requeue(key, msg)
+    logger.warning("运维告警全部发送失败，已放回队列待重发")
 
 
 async def _run_broadcast() -> None:
@@ -77,70 +131,71 @@ async def _run_broadcast() -> None:
     for scope, label, start, end in periods:
         try:
             r = await asyncio.to_thread(ranking.compute_range_rankings, start, end, scope=scope)
-            messages.append(ranking.format_leaderboards(r, _rank_title(label, start, end)))
+            messages.append(
+                ranking.format_leaderboards(
+                    r, _rank_title(label, start, end), with_active_days=(scope == "month")
+                )
+            )
         except Exception as e:
             logger.exception(f"{label}排行计算失败: {e}")
             alert.record(f"ranking:{scope}", f"{label}排行计算失败：{e}")
-    if not messages:
-        return
 
-    # 解析播报目标：bots 按 self_id 去重、群按白名单过滤（见 activity.resolve_targets）
-    bots, groups = await activity.resolve_targets()
-
-    # 运维告警：把本次积累的关键故障（平台接口异常 / 同步失败 / 排行失败）私聊管理员，
-    # 先于群播报发出，让管理员第一时间察觉「数据可能悄悄缺失」。同 key 去重见 services.alert。
-    alerts = alert.drain()
-    if alerts and bots:
-        text = f"⚠️ {settings.bot_name}运维提醒\n" + "\n".join(alerts)
-        for su in get_driver().config.superusers:
-            for bot in bots:
-                try:
-                    await bot.send_private_msg(user_id=int(su), message=text)
-                    break  # 一个 bot 发成功即可，避免多 bot 重复
-                except Exception as e:
-                    logger.warning(f"发送运维告警失败: {e}")
-
-    if not bots:
-        logger.warning("没有已连接的 OneBot Bot，跳过排行播报")
-        return
-    if not groups:
-        logger.warning("没有可播报的群，跳过排行播报")
-        return
-
-    for bot in bots:
-        for gid in groups:
-            for text in messages:
-                try:
-                    await bot.send_group_msg(group_id=gid, message=text)
-                    logger.info(f"已向群 {gid} 播报一段排行")
-                except Exception as e:
-                    logger.warning(f"向群 {gid} 播报失败: {e}")
-
-    # 群抽奖兜底：全群累计打卡突破阈值时开奖，公告到所有播报群（状态表保证只触发一次）
+    # 解析播报目标：bots 按 self_id 去重、群按白名单过滤（见 activity.resolve_targets）。
+    # 解析失败也只是「这一轮发不出去」，后面的抽奖/提醒/日历照样各自尝试。
     try:
-        lot = await asyncio.to_thread(_lottery_if_due)
+        bots, groups = await activity.resolve_targets()
     except Exception as e:
-        logger.warning(f"群抽奖检查失败: {e}")
-        lot = None
-    if lot:
-        t, winners = lot
-        text = (
-            f"🎉 全群累计打卡突破 {t} 天！群抽奖开奖：{'、'.join(winners)} "
-            f"获得{checkin.LOTTERY_PRIZE}～恭喜这位跑友！"
-        )
+        logger.warning(f"解析播报目标失败: {e}")
+        alert.record("resolve_targets", f"解析播报目标失败：{e}")
+        bots, groups = [], []
+
+    # 运维告警先于群播报发出（发送失败会放回队列，不会被 drain 掉）
+    await _send_private_alerts(alert.drain(), bots)
+
+    if bots and groups and messages:
         for bot in bots:
             for gid in groups:
-                try:
-                    await bot.send_group_msg(group_id=gid, message=text)
-                    logger.info(f"已向群 {gid} 发送群抽奖公告")
-                except Exception as e:
-                    logger.warning(f"向群 {gid} 发送群抽奖公告失败: {e}")
+                for text in messages:
+                    try:
+                        await bot.send_group_msg(group_id=gid, message=text)
+                        logger.info(f"已向群 {gid} 播报一段排行")
+                    except Exception as e:
+                        logger.warning(f"向群 {gid} 播报失败: {e}")
+                        alert.record(f"broadcast:{gid}", f"向群 {gid} 播报失败：{e}")
+    else:
+        logger.warning(
+            "跳过排行播报（bots=%d, groups=%d, 文案段落=%d）", len(bots), len(groups), len(messages)
+        )
 
-    # 活动提醒：明天有活动则提醒（搭 23:00 榜单播报时刻，幂等保证只提醒一次）
+    # 群抽奖兜底：全群累计打卡突破阈值时开奖，公告到所有播报群（状态表保证只触发一次）。
+    # 只在有群可公告时才开奖——否则状态被打上标记，公告就永远发不出去了。
+    if bots and groups:
+        try:
+            lot = await asyncio.to_thread(_lottery_if_due)
+        except Exception as e:
+            logger.warning(f"群抽奖检查失败: {e}")
+            alert.record("lottery", f"群抽奖检查失败：{e}")
+            lot = None
+        if lot:
+            t, winners = lot
+            text = (
+                f"🎉 全群累计打卡突破 {t} 天！群抽奖开奖：{'、'.join(winners)} "
+                f"获得{checkin.LOTTERY_PRIZE}～恭喜这位跑友！"
+            )
+            for bot in bots:
+                for gid in groups:
+                    try:
+                        await bot.send_group_msg(group_id=gid, message=text)
+                        logger.info(f"已向群 {gid} 发送群抽奖公告")
+                    except Exception as e:
+                        logger.warning(f"向群 {gid} 发送群抽奖公告失败: {e}")
+
+    # 活动提醒：明天有活动则提醒（搭播报时刻，按 (活动, 群) 幂等，见 activity.remind_tomorrow）
     try:
         await activity.remind_tomorrow(today)
     except Exception as e:
         logger.warning(f"活动提醒失败: {e}")
+        alert.record("remind_tomorrow", f"活动提醒失败：{e}")
 
     # 下月跑团日历：今天是本月最后一天 → 生成并发送下月日历图（同月只发一次）
     if (today + day).month != today.month:
@@ -149,6 +204,13 @@ async def _run_broadcast() -> None:
             await activity.send_next_month_calendar(next_first)
         except Exception as e:
             logger.warning(f"发送下月跑团日历失败: {e}")
+            alert.record("send_calendar", f"发送下月跑团日历失败：{e}")
+
+    # 标记「今天已播报」：错过时刻补播、重启重跑都靠它判重（放在最后，中途异常则不标记）
+    try:
+        await asyncio.to_thread(_mark_broadcast_done, today)
+    except Exception as e:
+        logger.warning(f"标记今日播报状态失败: {e}")
 
 
 def _rank_title(label: str, start: datetime.date, end: datetime.date) -> str:
@@ -166,10 +228,15 @@ async def _daily_broadcast_loop() -> None:
     while True:
         try:
             now = timeutil.now()
-            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if now >= target:
-                target += datetime.timedelta(days=1)
-            await asyncio.sleep((target - now).total_seconds())
+            scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # 补播：今天的时刻已过但还没打「已播报」标记（重启/休眠/上次失败）→ 立即补跑
+            if now >= scheduled and not await asyncio.to_thread(_broadcast_done, now.date()):
+                logger.info("今日播报时刻已过且无完成标记，立即补播")
+                await _run_broadcast()
+                continue
+            if now >= scheduled:
+                scheduled += datetime.timedelta(days=1)
+            await asyncio.sleep(max(1.0, (scheduled - now).total_seconds()))
             await _run_broadcast()
         except asyncio.CancelledError:
             raise
@@ -192,8 +259,8 @@ async def _member_notify_loop() -> None:
     """周期抽取 services.notify 里的成员提醒并私聊发送（同 qq 24h 去重）。
 
     独立于每日播报循环：授权失效等账号级故障需要尽快通知成员本人——
-    等 23:00 播报搭车太迟（当天数据已经缺失，成员越晚重新绑定缺得越多）。
-    无可用 Bot 或发送失败时放回队列重试（限次），不静默丢弃。
+    等播报搭车太迟（当天数据已经缺失，成员越晚重新绑定缺得越多）。
+    无可用 Bot 或发送失败时放回队列重试（限次）；成功送达才登记 24h 去重时间戳。
     """
     while True:
         await asyncio.sleep(30)
@@ -215,6 +282,7 @@ async def _member_notify_loop() -> None:
                 try:
                     await bots[0].send_private_msg(user_id=int(qq), message=text)
                     logger.info(f"已私聊通知成员 {qq}（账号级提醒）")
+                    notify.mark_sent(qq)
                 except Exception as e:
                     logger.warning(f"私聊通知成员 {qq} 失败: {e}")
                     notify.retry(qq, text, left)
@@ -229,7 +297,7 @@ async def _member_notify_loop() -> None:
 def start_scheduler() -> None:
     """在 driver on_startup 阶段调用，启动每日排行播报循环与成员提醒循环。
 
-    幂等：若 on_startup 被重复触发，也只创建一次循环任务，避免每天 23:00 重复播报。
+    幂等：若 on_startup 被重复触发，也只创建一次循环任务，避免每天重复播报。
     """
     global _started, _broadcast_task, _notify_task
     if _started:
